@@ -16,6 +16,57 @@ import {
 } from '../services/webhookTokens';
 import { isSuperAdmin, getUserCompanyId } from '../utils/companyAccess';
 import { processInboundMessage, processInboundMessageByContact } from '../services/inboundMessageProcessor';
+import { env } from '../config/env';
+
+/**
+ * Fetch email content from Resend API using email_id
+ */
+async function getEmailContentFromResend(emailId: string): Promise<{ text?: string; html?: string } | null> {
+  try {
+    const resendApiKey = env.RESEND_API_KEY;
+    if (!resendApiKey) {
+      logger.warn('[WEBHOOK] RESEND_API_KEY not configured, cannot fetch email content');
+      return null;
+    }
+
+    // Use the receiving endpoint for inbound emails
+    // See: https://resend.com/docs/api-reference/emails/retrieve-received-email
+    const response = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${resendApiKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      logger.error('[WEBHOOK] Failed to fetch email content from Resend', {
+        emailId,
+        status: response.status,
+        statusText: response.statusText,
+      });
+      return null;
+    }
+
+    const emailData = await response.json() as { text?: string; body?: string; html?: string };
+    logger.info('[WEBHOOK] Successfully fetched email content from Resend', {
+      emailId,
+      hasText: !!emailData.text,
+      hasHtml: !!emailData.html,
+    });
+    
+    return {
+      text: emailData.text || emailData.body,
+      html: emailData.html,
+    };
+  } catch (error: any) {
+    logger.error('[WEBHOOK] Error fetching email content from Resend', {
+      emailId,
+      error: error.message,
+    });
+    return null;
+  }
+}
 
 const router = Router();
 
@@ -271,6 +322,15 @@ router.post('/inbound/email/:token', async (req: Request, res: Response, next: N
       return res.status(404).json({ success: false, error: 'Invalid or expired token' });
     }
 
+    // Log full payload for debugging
+    logger.info('[WEBHOOK] Full email payload (token-based)', {
+      fullPayload: JSON.stringify(req.body, null, 2),
+      payloadKeys: Object.keys(req.body || {}),
+      hasData: !!req.body.data,
+      dataKeys: req.body.data ? Object.keys(req.body.data) : [],
+      contentType: req.headers['content-type'],
+    });
+
     // Extract email data from request (handle different provider formats)
     // Resend format: { data: { from, to, subject, text, html, ... }, type, created_at }
     // SendGrid format: { envelope, headers, text, html, ... }
@@ -303,6 +363,14 @@ router.post('/inbound/email/:token', async (req: Request, res: Response, next: N
       subject,
       hasText: !!text,
       hasHtml: !!html,
+      textPreview: text ? text.substring(0, 200) : null,
+      htmlPreview: html ? html.substring(0, 200) : null,
+      dataObject: data ? {
+        keys: Object.keys(data),
+        hasText: !!data.text,
+        hasBody: !!data.body,
+        hasHtml: !!data.html,
+      } : null,
     });
 
     if (!from || !subject) {
@@ -329,8 +397,22 @@ router.post('/inbound/email/:token', async (req: Request, res: Response, next: N
       contactId = contact?.id || null;
     }
 
+    // Extract email_id to fetch content from Resend
+    const emailId = data.email_id || req.body.email_id;
+    
+    // Try to get email content from Resend if we have email_id
+    let emailContent: { text?: string; html?: string } | null = null;
+    if (emailId) {
+      logger.info('[WEBHOOK] Fetching email content from Resend', { emailId });
+      emailContent = await getEmailContentFromResend(emailId);
+    }
+
+    // Use fetched content if available, otherwise fall back to extracted text/html
+    const finalText = emailContent?.text || text || html?.replace(/<[^>]*>/g, '') || null;
+    const finalHtml = emailContent?.html || html || null;
+
     // Create activity record for the inbound message
-    const activityDescription = text || html?.replace(/<[^>]*>/g, '') || 'Email reply received';
+    const activityDescription = finalText || 'Email reply received';
     const activityMetadata = {
       webhook_token_id: tokenData.id,
       original_campaign_id: tokenData.campaign_id,
@@ -365,7 +447,7 @@ router.post('/inbound/email/:token', async (req: Request, res: Response, next: N
     
     processInboundMessage({
       token,
-      messageBody: activityDescription,
+      messageBody: finalText || activityDescription,
       senderEmail: from,
       channel: 'email',
       metadata: {
@@ -396,9 +478,12 @@ router.post('/inbound/email/:token', async (req: Request, res: Response, next: N
  */
 router.post('/inbound/email', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Log the full request body to debug
-    logger.info('[WEBHOOK] Inbound email received (dashboard webhook) - Full payload', {
-      body: JSON.stringify(req.body),
+    // Log full payload for debugging
+    logger.info('[WEBHOOK] Full email payload (dashboard webhook)', {
+      fullPayload: JSON.stringify(req.body, null, 2),
+      payloadKeys: Object.keys(req.body || {}),
+      hasData: !!req.body.data,
+      dataKeys: req.body.data ? Object.keys(req.body.data) : [],
       contentType: req.headers['content-type'],
     });
 
@@ -434,7 +519,15 @@ router.post('/inbound/email', async (req: Request, res: Response, next: NextFunc
       subject,
       hasText: !!text,
       hasHtml: !!html,
+      textPreview: text ? text.substring(0, 200) : null,
+      htmlPreview: html ? html.substring(0, 200) : null,
       receivedFields: Object.keys(req.body),
+      dataObject: data ? {
+        keys: Object.keys(data),
+        hasText: !!data.text,
+        hasBody: !!data.body,
+        hasHtml: !!data.html,
+      } : null,
     });
 
     if (!from || !subject) {
@@ -471,6 +564,20 @@ router.post('/inbound/email', async (req: Request, res: Response, next: NextFunc
       return res.status(200).json({ success: false, message: 'Contact not found' });
     }
 
+    // Extract email_id to fetch content from Resend
+    const emailId = data.email_id || req.body.email_id;
+    
+    // Try to get email content from Resend if we have email_id
+    let emailContent: { text?: string; html?: string } | null = null;
+    if (emailId) {
+      logger.info('[WEBHOOK] Fetching email content from Resend', { emailId });
+      emailContent = await getEmailContentFromResend(emailId);
+    }
+
+    // Use fetched content if available, otherwise fall back to extracted text/html
+    const finalText = emailContent?.text || text || html?.replace(/<[^>]*>/g, '') || null;
+    const finalHtml = emailContent?.html || html || null;
+
     // Try to find webhook token from the most recent outbound email activity
     const recentActivity = await queryOne<{
       campaign_id: string | null;
@@ -478,7 +585,10 @@ router.post('/inbound/email', async (req: Request, res: Response, next: NextFunc
       webhook_token: string | null;
     }>(
       `SELECT a.id as activity_id,
-              (a.metadata->>'original_campaign_id')::uuid as campaign_id,
+              COALESCE(
+                (a.metadata->>'original_campaign_id')::uuid,
+                (a.metadata->>'campaign_id')::uuid
+              ) as campaign_id,
               a.metadata->>'webhook_token' as webhook_token
        FROM activities a
        WHERE a.related_to_id = $1
@@ -519,7 +629,7 @@ router.post('/inbound/email', async (req: Request, res: Response, next: NextFunc
     }
 
     // Create activity record for the inbound message
-    const activityDescription = text || html?.replace(/<[^>]*>/g, '') || 'Email reply received';
+    const activityDescription = finalText || 'Email reply received';
     const activityMetadata: any = {
       email_from: from,
       email_to: to,
@@ -588,7 +698,7 @@ router.post('/inbound/email', async (req: Request, res: Response, next: NextFunc
         contactId: contact.id,
         accountId: contact.account_id,
         campaignId,
-        messageBody: activityDescription,
+        messageBody: finalText || activityDescription,
         senderEmail: from,
         channel: 'email',
         metadata: {
@@ -771,7 +881,10 @@ router.post('/inbound/sms', async (req: Request, res: Response, next: NextFuncti
       webhook_token: string | null;
     }>(
       `SELECT a.id as activity_id,
-              (a.metadata->>'original_campaign_id')::uuid as campaign_id,
+              COALESCE(
+                (a.metadata->>'original_campaign_id')::uuid,
+                (a.metadata->>'campaign_id')::uuid
+              ) as campaign_id,
               a.metadata->>'webhook_token' as webhook_token
        FROM activities a
        WHERE a.related_to_id = $1

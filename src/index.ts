@@ -24,8 +24,59 @@ import webhooksRouter from './routes/webhooks';
 import aiAgentConfigsRouter from './routes/ai-agent-configs';
 import knowledgeBaseRouter from './routes/knowledge-base';
 import { connectMongoDB, disconnectMongoDB } from './db/mongodb';
+// Import campaign queue to initialize workers
+import './services/campaignQueue';
+import { query } from './db/connection';
 
 const app = express();
+
+/**
+ * Periodic check for campaigns that should be marked as completed
+ * Runs every 5 minutes to check campaigns past end_date
+ */
+async function checkCompletedCampaigns() {
+  try {
+    const campaigns = await query<{
+      id: string;
+      status: string;
+      end_date: Date | string | null;
+      metadata: string;
+    }>(
+      `SELECT id, status, end_date, metadata 
+       FROM campaigns 
+       WHERE status IN ('running', 'paused') 
+       AND end_date IS NOT NULL 
+       AND end_date <= CURRENT_TIMESTAMP`
+    );
+
+    const now = new Date();
+
+    for (const campaign of campaigns) {
+      const metadata = typeof campaign.metadata === 'string' 
+        ? JSON.parse(campaign.metadata) 
+        : campaign.metadata;
+
+      const totalJobs = metadata.total_jobs || 0;
+      const completedJobs = metadata.completed_jobs || 0;
+      const failedJobs = metadata.failed_jobs || 0;
+      const processedJobs = completedJobs + failedJobs;
+
+      // Mark as completed if all jobs are processed
+      if (totalJobs > 0 && processedJobs >= totalJobs) {
+        await query(
+          'UPDATE campaigns SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+          ['completed', campaign.id]
+        );
+        console.log(`[CAMPAIGN] Auto-completed campaign ${campaign.id} (end_date passed, all jobs done)`);
+      }
+    }
+  } catch (error: any) {
+    console.error('[CAMPAIGN] Error checking completed campaigns:', error.message);
+  }
+}
+
+// Run check every 5 minutes
+setInterval(checkCompletedCampaigns, 5 * 60 * 1000);
 
 // Middleware
 app.use(cors({

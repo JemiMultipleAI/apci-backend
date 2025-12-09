@@ -137,13 +137,20 @@ function sendMessageWithWebSocket(
     let agentResponse = '';
     let userMessageSent = false; // Track if we've sent the user message
     let greetingReceived = false; // Track if we've received the greeting
+    let greetingComplete = false; // Track if greeting is fully complete (including correction)
     let sessionStarted = false; // Track if session is confirmed started
     let connectionState: 'connecting' | 'open' | 'ready' | 'completed' | 'error' | 'closed' = 'connecting'; // Track connection state
+    let responseCompletionTimeout: NodeJS.Timeout | null = null; // Track completion delay after response
+    let lastResponseTime: number = 0; // Track when we last received a response
+    let waitingForToolResponse = false; // Track if we're waiting for tool execution to complete
 
     // Set timeout
     timeout = setTimeout(() => {
       if (!responseReceived) {
         connectionState = 'error';
+        if (responseCompletionTimeout) {
+          clearTimeout(responseCompletionTimeout);
+        }
         ws.close();
         reject(new Error('Agent response timeout after 30 seconds'));
       }
@@ -159,14 +166,11 @@ function sendMessageWithWebSocket(
       // Send initial message to start the session
       try {
         const sessionStartMessage = {
-          type: 'session_start',
-          agent_id: agentId,
-          override: {
-            skip_greeting: false, // Let greeting happen
-          }
+          type: 'user_message',
+          text: 'hi',
         };
         ws.send(JSON.stringify(sessionStartMessage));
-        logger.debug('[ELEVENLABS] Sent session_start message', {
+        logger.debug('[ELEVENLABS] Sent initial greeting trigger', {
           agentId: agentId.substring(0, 8) + '...',
         });
       } catch (error: any) {
@@ -242,50 +246,57 @@ function sendMessageWithWebSocket(
         // Handle greeting/correction - these come first, then we send our user message
         if (!userMessageSent) {
           if (message.type === 'agent_response' || message.type === 'message' || message.type === 'response') {
-            // This is the greeting - mark it as received
-            greetingReceived = true;
-            logger.debug('[ELEVENLABS] Received greeting, sending user message', {
-              agentId: agentId.substring(0, 8) + '...',
-            });
-            
-            // Wait a bit for session to fully establish before sending user message
-            // This ensures the session state is properly maintained
-            setTimeout(() => {
-              if (!userMessageSent) {
-                try {
-                  const userMessagePayload = {
-                    type: 'user_message',
-                    text: userMessage
-                  };
-                  ws.send(JSON.stringify(userMessagePayload));
-                  logger.debug('[ELEVENLABS] Sent user message', {
-                    agentId: agentId.substring(0, 8) + '...',
-                    messageLength: userMessage.length,
-                  });
-                  userMessageSent = true;
-                } catch (error: any) {
-                  clearTimeout(timeout);
-                  connectionState = 'error';
-                  const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
-                  logger.error('[ELEVENLABS] Failed to send user message', {
-                    agentId: agentId.substring(0, 8) + '...',
-                    error: errorMessage,
-                  });
-                  reject(new Error(`Failed to send message: ${errorMessage}`));
-                }
-              }
-            }, 500); // 500ms delay to ensure session is ready
-            return; // Don't resolve on greeting
-          } else if (message.type === 'agent_response_correction') {
-            // This is a correction to the greeting - if we haven't sent user message yet,
-            // send it now (correction means greeting is complete)
+            // This is the greeting - we receive it to establish session but wait for completion signal
             if (!greetingReceived) {
               greetingReceived = true;
-              logger.debug('[ELEVENLABS] Received greeting correction, sending user message', {
+              logger.debug('[ELEVENLABS] Received greeting, waiting for completion signal', {
                 agentId: agentId.substring(0, 8) + '...',
               });
               
-              // Wait a bit for session to fully establish before sending user message
+              // Fallback: If no correction message arrives within 5 seconds, send user message anyway
+              setTimeout(() => {
+                if (!greetingComplete && !userMessageSent) {
+                  logger.debug('[ELEVENLABS] No correction received, sending user message after timeout', {
+                    agentId: agentId.substring(0, 8) + '...',
+                  });
+                  greetingComplete = true; // Mark as complete to proceed
+                  
+                  try {
+                    const userMessagePayload = {
+                      type: 'user_message',
+                      text: userMessage
+                    };
+                    ws.send(JSON.stringify(userMessagePayload));
+                    logger.debug('[ELEVENLABS] Sent user message (fallback timeout)', {
+                      agentId: agentId.substring(0, 8) + '...',
+                      messageLength: userMessage.length,
+                    });
+                    userMessageSent = true;
+                  } catch (error: any) {
+                    clearTimeout(timeout);
+                    connectionState = 'error';
+                    const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
+                    logger.error('[ELEVENLABS] Failed to send user message (fallback)', {
+                      agentId: agentId.substring(0, 8) + '...',
+                      error: errorMessage,
+                    });
+                    reject(new Error(`Failed to send message: ${errorMessage}`));
+                  }
+                }
+              }, 5000); // 5 second fallback timeout
+              
+              // Don't send user message yet - wait for correction/completion signal
+              return;
+            }
+          } else if (message.type === 'agent_response_correction') {
+            // This is the correction signal - greeting is now complete, safe to send user message
+            if (!greetingComplete) {
+              greetingComplete = true;
+              logger.debug('[ELEVENLABS] Greeting complete (correction received), sending user message', {
+                agentId: agentId.substring(0, 8) + '...',
+              });
+              
+              // Now send the user message - greeting is fully complete, won't interrupt agent
               setTimeout(() => {
                 if (!userMessageSent) {
                   try {
@@ -303,42 +314,72 @@ function sendMessageWithWebSocket(
                     clearTimeout(timeout);
                     connectionState = 'error';
                     const errorMessage = error?.message || error?.toString() || String(error) || 'Unknown error';
-                    logger.error('[ELEVENLABS] Failed to send user message after correction', {
+                    logger.error('[ELEVENLABS] Failed to send user message', {
                       agentId: agentId.substring(0, 8) + '...',
                       error: errorMessage,
                     });
                     reject(new Error(`Failed to send message: ${errorMessage}`));
                   }
                 }
-              }, 500); // 500ms delay to ensure session is ready
+              }, 500); // Small delay just to be safe after completion signal
             }
-            return; // Don't resolve on correction
+            return; // IMPORTANT: Don't resolve on greeting correction - only resolve on actual user message response
           }
         }
 
-        // Handle response to our user message (only after we've sent it)
+        // Handle response to our actual user message (only after we've sent it)
+        // IMPORTANT: We only resolve here - the greeting response above is ignored
         if ((message.type === 'agent_response' || message.type === 'message' || message.type === 'response') && userMessageSent) {
           // Extract response text from various possible fields
-          agentResponse = message.agent_response_event?.agent_response ||
+          const newResponseText = message.agent_response_event?.agent_response ||
             message.message ||
             message.content ||
             message.text ||
             message.response ||
             message.data || '';
 
-          // Only resolve if we actually got a response
-          if (agentResponse.trim()) {
-            logger.info('[ELEVENLABS] Received agent response', {
+          // Accumulate response (in case of multiple chunks)
+          if (newResponseText.trim()) {
+            // If we already have a response, append with space (or replace if it's a correction)
+            if (agentResponse && !message.agent_response_event?.agent_response) {
+              agentResponse += ' ' + newResponseText;
+            } else {
+              agentResponse = newResponseText;
+            }
+            
+            lastResponseTime = Date.now();
+            waitingForToolResponse = false; // Reset tool waiting flag when we get an actual response
+            
+            logger.info('[ELEVENLABS] Received agent response chunk to user message', {
               agentId: agentId.substring(0, 8) + '...',
-              responseLength: agentResponse.length,
+              chunkLength: newResponseText.length,
+              totalLength: agentResponse.length,
               responsePreview: agentResponse.substring(0, 100),
             });
-            responseReceived = true;
-            connectionState = 'completed';
-            clearTimeout(timeout);
-            ws.close();
-            resolve({ response: agentResponse });
-            return;
+
+            // Clear any existing completion timeout
+            if (responseCompletionTimeout) {
+              clearTimeout(responseCompletionTimeout);
+            }
+
+            // Wait 1.5 seconds after the last response before closing
+            // This gives the agent time to send any additional chunks or corrections
+            responseCompletionTimeout = setTimeout(() => {
+              if (agentResponse.trim() && !responseReceived && !waitingForToolResponse) {
+                logger.info('[ELEVENLABS] Response complete (no more messages received)', {
+                  agentId: agentId.substring(0, 8) + '...',
+                  finalResponseLength: agentResponse.length,
+                });
+                responseReceived = true;
+                connectionState = 'completed';
+                clearTimeout(timeout);
+                if (responseCompletionTimeout) {
+                  clearTimeout(responseCompletionTimeout);
+                }
+                ws.close();
+                resolve({ response: agentResponse });
+              }
+            }, 1500); // Wait 1.5 seconds after last message
           } else {
             logger.warn('[ELEVENLABS] Received empty agent response', {
               agentId: agentId.substring(0, 8) + '...',
@@ -355,12 +396,71 @@ function sendMessageWithWebSocket(
               responsePreview: correctedResponse.substring(0, 100),
             });
             agentResponse = correctedResponse;
+            lastResponseTime = Date.now();
+            
+            // Clear any existing completion timeout
+            if (responseCompletionTimeout) {
+              clearTimeout(responseCompletionTimeout);
+            }
+
+            // Wait 1.5 seconds after correction before closing
+            responseCompletionTimeout = setTimeout(() => {
+              if (!responseReceived) {
+                responseReceived = true;
+                connectionState = 'completed';
+                clearTimeout(timeout);
+                if (responseCompletionTimeout) {
+                  clearTimeout(responseCompletionTimeout);
+                }
+                ws.close();
+                resolve({ response: agentResponse });
+              }
+            }, 1500);
+          }
+        } else if (
+          message.type === 'tool_call' || 
+          message.type === 'tool_response' || 
+          message.type === 'function_call' || 
+          message.type === 'function_response' ||
+          message.type === 'tool_use' ||
+          message.type === 'tool_result' ||
+          (message.type && typeof message.type === 'string' && message.type.toLowerCase().includes('tool'))
+        ) {
+          // Tool-related messages - agent is using tools, wait for final response
+          waitingForToolResponse = true;
+          logger.info('[ELEVENLABS] Received tool response, waiting for agent final response', {
+            agentId: agentId.substring(0, 8) + '...',
+            toolMessageType: message.type,
+            hasResponse: !!agentResponse,
+          });
+          
+          // Clear any existing completion timeout - we're waiting for tools to complete
+          if (responseCompletionTimeout) {
+            clearTimeout(responseCompletionTimeout);
+            responseCompletionTimeout = null;
+          }
+          
+          // Don't close connection - wait for agent's final response after tool execution
+          return;
+        } else if (message.type === 'response.completed' || message.type === 'conversation.completed' || message.type === 'completed') {
+          // Explicit completion signal - close immediately (but only if not waiting for tools)
+          if (agentResponse.trim() && !responseReceived && !waitingForToolResponse) {
+            logger.info('[ELEVENLABS] Received explicit completion signal', {
+              agentId: agentId.substring(0, 8) + '...',
+              responseLength: agentResponse.length,
+            });
+            if (responseCompletionTimeout) {
+              clearTimeout(responseCompletionTimeout);
+            }
             responseReceived = true;
             connectionState = 'completed';
             clearTimeout(timeout);
             ws.close();
             resolve({ response: agentResponse });
-            return;
+          } else if (waitingForToolResponse) {
+            logger.debug('[ELEVENLABS] Received completion signal but still waiting for tool response', {
+              agentId: agentId.substring(0, 8) + '...',
+            });
           }
         } else if (message.type === 'ping' || message.type === 'pong' || message.type === 'status' ||
           message.type === 'conversation_initiation_metadata' || message.type === 'metadata' ||
@@ -397,11 +497,26 @@ function sendMessageWithWebSocket(
             responsePreview: textResponse.substring(0, 100),
           });
           agentResponse = textResponse;
-          responseReceived = true;
-          connectionState = 'completed';
-          clearTimeout(timeout);
-          ws.close();
-          resolve({ response: agentResponse });
+          lastResponseTime = Date.now();
+          
+          // Clear any existing completion timeout
+          if (responseCompletionTimeout) {
+            clearTimeout(responseCompletionTimeout);
+          }
+
+          // Wait 1.5 seconds after plain text response before closing
+          responseCompletionTimeout = setTimeout(() => {
+            if (!responseReceived) {
+              responseReceived = true;
+              connectionState = 'completed';
+              clearTimeout(timeout);
+              if (responseCompletionTimeout) {
+                clearTimeout(responseCompletionTimeout);
+              }
+              ws.close();
+              resolve({ response: agentResponse });
+            }
+          }, 1500);
         } else {
           logger.debug('[ELEVENLABS] Ignoring keepalive text message', {
             agentId: agentId.substring(0, 8) + '...',
@@ -421,6 +536,9 @@ function sendMessageWithWebSocket(
         errorStack: error?.stack,
       });
       clearTimeout(timeout);
+      if (responseCompletionTimeout) {
+        clearTimeout(responseCompletionTimeout);
+      }
       if (!responseReceived) {
         reject(new Error(`WebSocket error: ${errorMessage}`));
       }
@@ -430,6 +548,11 @@ function sendMessageWithWebSocket(
     ws.on('close', (code: number, reason: Buffer) => {
       connectionState = 'closed';
       const reasonStr = reason.toString() || 'Connection closed';
+      
+      // Clean up completion timeout if connection closes
+      if (responseCompletionTimeout) {
+        clearTimeout(responseCompletionTimeout);
+      }
       
       if (!responseReceived) {
         logger.warn('[ELEVENLABS] WebSocket closed before response', {

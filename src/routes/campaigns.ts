@@ -12,6 +12,7 @@ import { isSuperAdmin, getUserCompanyId } from '../utils/companyAccess';
 import { env } from '../config/env';
 import { createWebhookToken, generateReplyToEmail, generateSMSWebhookUrl, generateEmailWebhookUrl, getOrCreateCampaignWebhookToken } from '../services/webhookTokens';
 import { updateKnowledgeBaseDocument } from '../services/elevenlabsKnowledgeBase';
+import { campaignQueue, calculateDelay, CampaignJobData } from '../services/campaignQueue';
 
 const router = Router();
 
@@ -66,6 +67,12 @@ async function refreshCompanyKnowledgeBase(accountId: string | null): Promise<vo
   }
 }
 
+const channelConfigSchema = z.object({
+  enabled: z.boolean(),
+  delay: z.number().min(0),
+  unit: z.enum(['minutes', 'hours', 'days']),
+});
+
 const createCampaignSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
@@ -74,7 +81,22 @@ const createCampaignSchema = z.object({
   status: z.enum(['draft', 'scheduled', 'running', 'paused', 'completed']).optional(),
   start_date: z.string().optional().nullable(),
   end_date: z.string().optional().nullable(),
-  metadata: z.record(z.string(), z.any()).optional(),
+  metadata: z.object({
+    contact_ids: z.array(z.string().uuid()).optional(),
+    template_id: z.string().uuid().optional(),
+    survey_id: z.string().uuid().optional(),
+    days_inactive: z.number().optional(),
+    channels: z.object({
+      email: channelConfigSchema.optional(),
+      sms: channelConfigSchema.optional(),
+      call: channelConfigSchema.optional(),
+    }).optional(),
+    create_followup_task: z.boolean().optional(),
+    followup_task_title: z.string().optional(),
+    followup_task_description: z.string().optional(),
+    followup_task_days: z.number().optional(),
+    followup_task_priority: z.string().optional(),
+  }).passthrough().optional(), // passthrough allows additional fields for backward compatibility
 });
 
 // GET /api/campaigns - List all campaigns
@@ -559,10 +581,19 @@ router.post('/:id/activate', authenticate, enrichUser, async (req: Request, res:
       }
     }
 
-    const newStatus = campaign.status === 'paused' ? 'running' : 'running';
+    // Validate status transition
+    if (campaign.status === 'completed') {
+      throw createError('Cannot activate a completed campaign', 400);
+    }
+
+    if (campaign.status === 'running') {
+      throw createError('Campaign is already running', 400);
+    }
+
+    // Activate campaign (from draft, paused, or scheduled)
     const result = await queryOne(
       'UPDATE campaigns SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *',
-      [newStatus, id]
+      ['running', id]
     );
 
     res.json({
@@ -613,10 +644,16 @@ router.post('/:id/pause', authenticate, enrichUser, async (req: Request, res: Re
       }
     }
 
+    // Validate status transition
     if (campaign.status !== 'running') {
       throw createError('Only running campaigns can be paused', 400);
     }
 
+    // Note: We don't cancel queued jobs when pausing
+    // Jobs will still execute, but campaign status shows as paused
+    // This allows for flexibility - admin can pause to stop new executions
+    // but already queued messages will still send
+    
     const result = await queryOne(
       'UPDATE campaigns SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *',
       ['paused', id]
@@ -656,6 +693,7 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       status: string;
       metadata: string;
       created_by: string | null;
+      end_date: Date | string | null;
     }>('SELECT * FROM campaigns WHERE id = $1', [id]);
 
     if (!campaign) {
@@ -765,13 +803,19 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       throw createError('No contacts found for campaign execution', 400);
     }
 
-    // Execute campaign based on channel
-    const results = {
-      total: contacts.length,
-      success: 0,
-      failed: 0,
-      errors: [] as string[],
-    };
+    // Validate campaign can be executed
+    if (campaign.status === 'completed') {
+      throw createError('Cannot execute a completed campaign', 400);
+    }
+
+    // Check if campaign has passed end_date
+    if (campaign.end_date) {
+      const endDate = new Date(campaign.end_date);
+      const now = new Date();
+      if (now > endDate) {
+        throw createError('Campaign end date has passed. Cannot execute.', 400);
+      }
+    }
 
     const userId = req.user?.userId;
     const metadata = typeof campaign.metadata === 'string' 
@@ -781,9 +825,50 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     // Get user's company ID for webhook token creation
     const userCompanyId = req.userCompanyId ?? (req.user ? await getUserCompanyId(req.user) : null);
 
-    // Track contacts that have been successfully contacted (for follow-up tasks)
-    const contactedContactIds = new Set<string>();
+    // Get channel configuration from metadata or use legacy channel field
+    let channels: {
+      email?: { enabled: boolean; delay: number; unit: 'minutes' | 'hours' | 'days' };
+      sms?: { enabled: boolean; delay: number; unit: 'minutes' | 'hours' | 'days' };
+      call?: { enabled: boolean; delay: number; unit: 'minutes' | 'hours' | 'days' };
+    } = {};
 
+    if (metadata?.channels) {
+      channels = metadata.channels;
+    } else {
+      // Backward compatibility: infer from channel field
+      const channel = campaign.channel;
+      if (channel === 'email') {
+        channels = { email: { enabled: true, delay: 0, unit: 'minutes' } };
+      } else if (channel === 'sms') {
+        channels = { sms: { enabled: true, delay: 0, unit: 'minutes' } };
+      } else if (channel === 'call') {
+        channels = { call: { enabled: true, delay: 0, unit: 'minutes' } };
+      } else if (channel === 'multi') {
+        channels = {
+          email: { enabled: true, delay: 0, unit: 'minutes' },
+          sms: { enabled: true, delay: 60, unit: 'minutes' },
+        };
+      }
+    }
+
+    // Validate at least one channel is enabled
+    const enabledChannels = Object.entries(channels).filter(([_, config]) => config.enabled);
+    if (enabledChannels.length === 0) {
+      throw createError('No channels enabled for campaign execution', 400);
+    }
+
+    // Queue jobs for each contact and channel
+    const results = {
+      total: contacts.length,
+      queued: 0,
+      failed: 0,
+      errors: [] as string[],
+      jobs: [] as string[],
+    };
+
+    const campaignStartTime = new Date();
+
+    // Prepare template variables for all contacts
     for (const contact of contacts) {
       try {
         // Prepare template variables
@@ -795,261 +880,63 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
           full_name: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
         };
 
-        let activityType = 'note';
-        let activityDescription = '';
-        let activitySubject = '';
-        let contactSuccessful = false;
-        let emailResult: EmailResult | undefined;
-        let smsResult: SMSResult | undefined;
-        let callResult: VoiceCallResult | undefined;
-        let webhookToken: { id: string; token: string } | null = null;
-        let replyToEmail: string | undefined;
-
-        // Generate webhook token for inbound replies (if company ID is available)
-        if (userCompanyId && (campaign.channel === 'email' || campaign.channel === 'sms' || campaign.channel === 'multi')) {
-          try {
-            const tokenType = campaign.channel === 'email' ? 'email' : campaign.channel === 'sms' ? 'sms' : 'both';
-            const token = await createWebhookToken({
-              account_id: userCompanyId,
-              campaign_id: campaign.id,
-              contact_id: contact.id,
-              type: tokenType,
-              created_by: userId || null,
-            });
-            webhookToken = { id: token.id, token: token.token };
-            
-            if (tokenType === 'email' || tokenType === 'both') {
-              replyToEmail = generateReplyToEmail(token.token);
-            }
-            // Note: SMS webhooks are now handled via Twilio dashboard configuration
-            // We don't need to pass statusCallback for inbound messages
-            // Tokens are still created for tracking, but not used in the SMS API call
-          } catch (error: any) {
-            logger.warn('Failed to create webhook token', { error: error.message, contactId: contact.id });
-            // Continue without webhook token - not critical for sending
-          }
-        }
-
-        // Handle survey campaigns
-        if (campaign.type === 'survey' && survey) {
-          // Generate survey link (in production, this would be a proper URL)
-          const surveyLink = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/survey/${survey.id}?contact=${contact.id}`;
+        // Queue jobs for each enabled channel
+        for (const [channelName, channelConfig] of enabledChannels) {
+          const channel = channelName as 'email' | 'sms' | 'call';
           
-          if (campaign.channel === 'email' || campaign.channel === 'multi') {
-            if (!contact.email) {
-              results.failed++;
-              results.errors.push(`${contact.first_name} ${contact.last_name}: No email address`);
-              continue;
-            }
-
-            const surveyEmailSubject = `Survey: ${survey.name}`;
-            const surveyEmailBody = `Hi ${contact.first_name},\n\nWe'd love to hear your feedback! Please take a moment to complete our survey:\n\n${surveyLink}\n\nThank you!`;
-
-            emailResult = await sendEmailFromTemplate(
-              contact.email,
-              surveyEmailSubject,
-              surveyEmailBody,
-              { ...variables, survey_link: surveyLink },
-              undefined,
-              replyToEmail
-            );
-
-            if (emailResult.success) {
-              results.success++;
-              contactSuccessful = true;
-              activityType = 'survey';
-              activitySubject = surveyEmailSubject;
-              activityDescription = `Sent survey: ${survey.name}`;
-            } else {
-              results.failed++;
-              results.errors.push(`${contact.first_name} ${contact.last_name}: ${emailResult.error}`);
-              continue;
-            }
-          }
-
-          if (campaign.channel === 'sms' || campaign.channel === 'multi') {
-            if (!contact.phone && !contact.mobile) {
-              results.failed++;
-              results.errors.push(`${contact.first_name} ${contact.last_name}: No phone number`);
-              continue;
-            }
-
-            const surveySMSBody = `Hi ${contact.first_name}, please take our survey: ${surveyLink}`;
-
-            smsResult = await sendSMSFromTemplate(
-              contact.phone || contact.mobile,
-              surveySMSBody,
-              { ...variables, survey_link: surveyLink },
-              undefined,
-              undefined
-            );
-
-            if (smsResult.success) {
-              if (campaign.channel !== 'multi') results.success++;
-              contactSuccessful = true;
-              if (activityType === 'note') {
-                activityType = 'survey';
-                activityDescription = `Sent survey: ${survey.name}`;
-              }
-            } else {
-              results.failed++;
-              results.errors.push(`${contact.first_name} ${contact.last_name}: ${smsResult.error}`);
-              if (campaign.channel === 'sms') continue;
-            }
-          }
-        } else if (campaign.channel === 'email' || campaign.channel === 'multi') {
-          if (!contact.email) {
+          // Validate contact has required info for channel
+          if (channel === 'email' && !contact.email) {
             results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: No email address`);
+            results.errors.push(`${contact.first_name} ${contact.last_name}: No email address for ${channel}`);
+            continue;
+          }
+          if ((channel === 'sms' || channel === 'call') && !contact.phone && !contact.mobile) {
+            results.failed++;
+            results.errors.push(`${contact.first_name} ${contact.last_name}: No phone number for ${channel}`);
             continue;
           }
 
-          emailResult = await sendEmailFromTemplate(
-            contact.email,
-            template.subject || campaign.name,
-            template.body,
+          // Calculate delay in milliseconds
+          const delayMs = calculateDelay(channelConfig.delay, channelConfig.unit);
+          const scheduledTime = new Date(campaignStartTime.getTime() + delayMs);
+
+          // Create job data
+          const jobData: CampaignJobData = {
+            campaignId: campaign.id,
+            contactId: contact.id,
+            channel,
             variables,
-            undefined,
-            replyToEmail
-          );
-
-          if (emailResult.success) {
-            results.success++;
-            contactSuccessful = true;
-            activityType = 'email';
-            activitySubject = template.subject || campaign.name;
-            activityDescription = `Sent email: ${template.subject || campaign.name}`;
-          } else {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: ${emailResult.error}`);
-            continue;
-          }
-        }
-
-        if (campaign.channel === 'sms' || campaign.channel === 'multi') {
-          if (!contact.phone && !contact.mobile) {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: No phone number`);
-            continue;
-          }
-
-          // Note: SMS webhooks are configured in Twilio dashboard, not per-message
-          smsResult = await sendSMSFromTemplate(
-            contact.phone || contact.mobile,
-            template.body,
-            variables
-          );
-
-          if (smsResult.success) {
-            if (campaign.channel !== 'multi') results.success++;
-            contactSuccessful = true;
-            activityType = 'sms';
-            activityDescription = `Sent SMS: ${template.name}`;
-          } else {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: ${smsResult.error}`);
-            if (campaign.channel === 'sms') continue;
-          }
-        }
-
-        if (campaign.channel === 'call') {
-          if (!contact.phone && !contact.mobile) {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: No phone number`);
-            continue;
-          }
-
-          callResult = await makeVoiceCallFromTemplate(
-            contact.phone || contact.mobile,
-            template.body,
-            variables
-          );
-
-          if (callResult.success) {
-            results.success++;
-            contactSuccessful = true;
-            activityType = 'call';
-            activityDescription = `Made call: ${template.name}`;
-          } else {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: ${callResult.error}`);
-            continue;
-          }
-        }
-
-        // Create activity record with campaign metadata
-        if (activityDescription) {
-          const activityMetadata: any = {
-            campaign_id: campaign.id,
-            campaign_name: campaign.name,
-            campaign_type: campaign.type,
-            campaign_channel: campaign.channel,
-            ...(survey && { survey_id: survey.id, survey_name: survey.name }),
-            ...(template && { template_id: template.id, template_name: template.name }),
+            userId: userId || undefined,
+            accountId: userCompanyId || undefined,
           };
 
-          // Store message IDs and webhook token for webhook tracking
-          if (emailResult?.success && emailResult.messageId) {
-            activityMetadata.email_message_id = emailResult.messageId;
-            activityMetadata.email_provider = env.EMAIL_PROVIDER || 'sendgrid';
+          if (template) {
+            jobData.templateId = template.id;
           }
-          if (smsResult?.success && smsResult.messageId) {
-            activityMetadata.sms_message_sid = smsResult.messageId;
-            activityMetadata.sms_provider = 'twilio';
-          }
-          if (callResult?.success && callResult.callId) {
-            activityMetadata.call_sid = callResult.callId;
-            activityMetadata.call_provider = 'twilio';
-          }
-          if (webhookToken) {
-            activityMetadata.webhook_token_id = webhookToken.id;
-            activityMetadata.webhook_token = webhookToken.token;
-            if (replyToEmail) {
-              activityMetadata.reply_to_email = replyToEmail;
-            }
-            // Store webhook token URL for SMS (even though we use dashboard webhook, token is useful for context)
-            if (campaign.channel === 'sms' || campaign.channel === 'multi') {
-              const publicWebhookUrl = env.PUBLIC_WEBHOOK_URL || env.API_BASE_URL;
-              activityMetadata.sms_webhook_url = `${publicWebhookUrl}/api/webhooks/inbound/sms/${webhookToken.token}`;
-            }
+          if (survey) {
+            jobData.surveyId = survey.id;
           }
 
-          const activityResult = await queryOne<{ id: string }>(
-            `INSERT INTO activities (type, subject, description, related_to_type, related_to_id, performed_by, metadata, account_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             RETURNING id`,
-            [
-              activityType,
-              activitySubject || null,
-              activityDescription,
-              'contact',
-              contact.id,
-              userId,
-              JSON.stringify(activityMetadata),
-              contact.account_id,
-            ]
+          // Queue the job
+          const job = await campaignQueue.add(
+            'campaign-message', // Generic name that matches the process handler
+            jobData,
+            {
+              delay: delayMs,
+              jobId: `campaign-${campaign.id}-${channel}-${contact.id}-${Date.now()}`,
+            }
           );
 
-          // Update webhook token with activity ID if created
-          if (webhookToken && activityResult) {
-            await query(
-              'UPDATE webhook_tokens SET activity_id = $1 WHERE id = $2',
-              [activityResult.id, webhookToken.id]
-            );
-          }
+          results.queued++;
+          results.jobs.push(job.id.toString());
 
-          // Update webhook token with activity ID if created
-          if (webhookToken && activityResult) {
-            await query(
-              'UPDATE webhook_tokens SET activity_id = $1 WHERE id = $2',
-              [activityResult.id, webhookToken.id]
-            );
-          }
-
-          // Track successfully contacted contacts for follow-up tasks
-          if (contactSuccessful) {
-            contactedContactIds.add(contact.id);
-          }
+          logger.info('[CAMPAIGN] Queued job', {
+            jobId: job.id,
+            campaignId: campaign.id,
+            contactId: contact.id,
+            channel,
+            scheduledTime: scheduledTime.toISOString(),
+          });
         }
       } catch (error: any) {
         results.failed++;
@@ -1057,53 +944,107 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       }
     }
 
-    // Create follow-up tasks for successfully contacted contacts (if enabled)
-    if (metadata?.create_followup_task && contactedContactIds.size > 0) {
-      const taskTitle = metadata.followup_task_title || `Follow up: ${campaign.name}`;
-      const daysUntilDue = metadata.followup_task_days || 3;
-      const dueDate = new Date();
-      dueDate.setDate(dueDate.getDate() + daysUntilDue);
+    // Store job IDs in campaign metadata for tracking
+    const updatedMetadata = {
+      ...metadata,
+      job_ids: results.jobs,
+      total_jobs: results.jobs.length,
+      completed_jobs: 0,
+      failed_jobs: 0,
+    };
 
-      for (const contactId of contactedContactIds) {
-        try {
-          const contact = contacts.find(c => c.id === contactId);
-          if (!contact) continue;
-
-          const taskDescription = metadata.followup_task_description 
-            ? metadata.followup_task_description.replace('{{contact_name}}', `${contact.first_name} ${contact.last_name}`)
-            : `Follow up with ${contact.first_name} ${contact.last_name} regarding ${campaign.name}`;
-
-          await query(
-            `INSERT INTO tasks (title, description, assigned_to, related_to_type, related_to_id, due_date, status, priority)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-            [
-              taskTitle,
-              taskDescription,
-              userId || null, // Assign to campaign creator
-              'contact',
-              contactId,
-              dueDate.toISOString(),
-              'pending',
-              metadata.followup_task_priority || 'medium',
-            ]
-          );
-          logger.debug('Created follow-up task for campaign', { campaignId: campaign.id, contactId });
-        } catch (taskError: any) {
-          // Don't fail campaign execution if task creation fails
-          logger.warn('Failed to create follow-up task', { error: taskError.message, campaignId: campaign.id, contactId });
-        }
-      }
-    }
-
-    // Update campaign status
     await query(
-      'UPDATE campaigns SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-      ['completed', id]
+      'UPDATE campaigns SET metadata = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
+      [JSON.stringify(updatedMetadata), 'running', id]
     );
 
     res.json({
       success: true,
       data: results,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/campaigns/:id/status - Get campaign status with job statistics
+router.get('/:id/status', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!req.user) {
+      return next(createError('Unauthorized', 401));
+    }
+
+    const { id } = req.params;
+    
+    // Validate UUID format
+    const uuidSchema = z.string().uuid();
+    if (!uuidSchema.safeParse(id).success) {
+      throw createError('Invalid campaign ID format', 400);
+    }
+
+    const campaign = await queryOne<{
+      id: string;
+      status: string;
+      end_date: Date | string | null;
+      metadata: string;
+      created_by: string | null;
+    }>('SELECT id, status, end_date, metadata, created_by FROM campaigns WHERE id = $1', [id]);
+
+    if (!campaign) {
+      throw createError('Campaign not found', 404);
+    }
+
+    // Check company access for non-super_admin users
+    if (!isSuperAdmin(req.user) && campaign.created_by) {
+      const creator = await queryOne<{ account_id: string | null }>(
+        'SELECT account_id FROM users WHERE id = $1',
+        [campaign.created_by]
+      );
+      
+      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (creator && creator.account_id !== userCompanyId) {
+        logger.warn('Campaign status access denied', { userId: req.user.userId, campaignId: id });
+        throw createError('Forbidden: You do not have access to this campaign', 403);
+      }
+    }
+
+    const metadata = typeof campaign.metadata === 'string' 
+      ? JSON.parse(campaign.metadata) 
+      : campaign.metadata;
+
+    const totalJobs = metadata.total_jobs || 0;
+    const completedJobs = metadata.completed_jobs || 0;
+    const failedJobs = metadata.failed_jobs || 0;
+    const processedJobs = completedJobs + failedJobs;
+    const pendingJobs = totalJobs - processedJobs;
+
+    const endDate = campaign.end_date ? new Date(campaign.end_date) : null;
+    const now = new Date();
+    const endDatePassed = endDate ? now >= endDate : false;
+
+    // Check if campaign should be completed (trigger check)
+    if (campaign.status === 'running' && endDatePassed && totalJobs > 0 && processedJobs >= totalJobs) {
+      await query(
+        'UPDATE campaigns SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        ['completed', id]
+      );
+      campaign.status = 'completed';
+    }
+
+    res.json({
+      success: true,
+      data: {
+        status: campaign.status,
+        end_date: campaign.end_date,
+        end_date_passed: endDatePassed,
+        jobs: {
+          total: totalJobs,
+          completed: completedJobs,
+          failed: failedJobs,
+          pending: pendingJobs,
+          progress_percentage: totalJobs > 0 ? Math.round((processedJobs / totalJobs) * 100) : 0,
+        },
+      },
     });
   } catch (error) {
     next(error);
