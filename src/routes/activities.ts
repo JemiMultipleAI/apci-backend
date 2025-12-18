@@ -215,5 +215,151 @@ router.get('/timeline/:type/:id', authenticate, enrichUser, async (req: Request,
   }
 });
 
+// GET /api/activities/conversations - Get activities grouped into conversations
+router.get('/conversations', authenticate, enrichUser, applyCompanyFilter('a'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!req.user) {
+      return next(createError('Unauthorized', 401));
+    }
+
+    const { page = '1', limit = '20', type, contact_id } = req.query;
+    const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
+    
+    let whereClause = 'WHERE 1=1';
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    // Apply company filter
+    if (req.companyFilter && req.companyFilter.value !== null) {
+      whereClause += ` ${req.companyFilter.clause}`;
+      params.push(req.companyFilter.value);
+      paramIndex = req.companyFilter.paramIndex + 1;
+    }
+
+    // Filter by type (email or sms only for conversations)
+    if (type && (type === 'email' || type === 'sms')) {
+      whereClause += ` AND a.type = $${paramIndex}`;
+      params.push(type);
+      paramIndex++;
+    } else {
+      // Default to email and sms only
+      whereClause += ` AND a.type IN ('email', 'sms')`;
+    }
+
+    // Filter by contact if provided
+    if (contact_id) {
+      whereClause += ` AND a.related_to_type = 'contact' AND a.related_to_id = $${paramIndex}`;
+      params.push(contact_id);
+      paramIndex++;
+    }
+
+    // Get activities with contact information
+    const activities = await query(
+      `SELECT 
+        a.*,
+        u.first_name || ' ' || u.last_name as performed_by_name,
+        c.first_name as contact_first_name,
+        c.last_name as contact_last_name,
+        c.email as contact_email,
+        c.mobile as contact_mobile
+       FROM activities a
+       LEFT JOIN users u ON a.performed_by = u.id
+       LEFT JOIN contacts c ON a.related_to_type = 'contact' AND a.related_to_id = c.id
+       ${whereClause}
+       ORDER BY a.created_at DESC
+       LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...params, parseInt(limit as string), offset]
+    );
+
+    // Group activities into conversations
+    // A conversation is defined by: contact_id + channel (email/sms)
+    const conversationsMap = new Map<string, {
+      contact_id: string | null;
+      contact_name: string;
+      contact_email: string | null;
+      contact_mobile: string | null;
+      channel: string;
+      messages: any[];
+      last_activity: Date;
+    }>();
+
+    for (const activity of activities) {
+      const contactId = activity.related_to_id || 'unknown';
+      const channel = activity.type; // email or sms
+      const conversationKey = `${contactId}_${channel}`;
+
+      if (!conversationsMap.has(conversationKey)) {
+        conversationsMap.set(conversationKey, {
+          contact_id: activity.related_to_id,
+          contact_name: activity.contact_first_name && activity.contact_last_name
+            ? `${activity.contact_first_name} ${activity.contact_last_name}`
+            : activity.contact_email || activity.contact_mobile || 'Unknown Contact',
+          contact_email: activity.contact_email,
+          contact_mobile: activity.contact_mobile,
+          channel: channel,
+          messages: [],
+          last_activity: new Date(activity.created_at),
+        });
+      }
+
+      const conversation = conversationsMap.get(conversationKey)!;
+      const isInbound = activity.metadata?.inbound === true;
+      const isOutbound = activity.metadata?.outbound === true || !isInbound;
+
+      conversation.messages.push({
+        id: activity.id,
+        type: activity.type,
+        subject: activity.subject,
+        description: activity.description,
+        performed_by_name: activity.performed_by_name,
+        created_at: activity.created_at,
+        metadata: activity.metadata,
+        direction: isInbound ? 'inbound' : 'outbound',
+        ai_generated: activity.metadata?.ai_generated === true,
+      });
+
+      // Update last activity if this is more recent
+      const activityDate = new Date(activity.created_at);
+      if (activityDate > conversation.last_activity) {
+        conversation.last_activity = activityDate;
+      }
+    }
+
+    // Convert map to array and sort by last activity
+    const conversations = Array.from(conversationsMap.values())
+      .map(conv => ({
+        ...conv,
+        messages: conv.messages.sort((a, b) => 
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        ),
+      }))
+      .sort((a, b) => b.last_activity.getTime() - a.last_activity.getTime());
+
+    const countResult = await queryOne<{ count: string }>(
+      `SELECT COUNT(DISTINCT a.related_to_id || '_' || a.type) as count 
+       FROM activities a 
+       ${whereClause} 
+       AND a.related_to_type = 'contact' 
+       AND a.type IN ('email', 'sms')`,
+      params
+    );
+
+    const total = parseInt(countResult?.count || '0', 10);
+
+    res.json({
+      success: true,
+      data: conversations,
+      pagination: {
+        page: parseInt(page as string),
+        limit: parseInt(limit as string),
+        total,
+        totalPages: Math.ceil(total / parseInt(limit as string)),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;
 

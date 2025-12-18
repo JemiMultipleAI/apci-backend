@@ -13,13 +13,11 @@ interface ContactQueryResult {
   first_name: string;
   last_name: string;
   email: string | null;
-  phone: string | null;
   mobile: string | null;
   job_title: string | null;
   department: string | null;
   owner_id: string | null;
   lifecycle_stage: string;
-  tags: string[];
   notes: string | null;
   custom_fields: Record<string, any>;
   created_at: Date;
@@ -34,13 +32,11 @@ const createContactSchema = z.object({
   first_name: z.string().min(1),
   last_name: z.string().min(1),
   email: z.string().email().optional().nullable(),
-  phone: z.string().optional().nullable(),
   mobile: z.string().optional().nullable(),
   job_title: z.string().optional().nullable(),
   department: z.string().optional().nullable(),
   owner_id: z.string().uuid().optional().nullable(),
   lifecycle_stage: z.enum(['lead', 'qualified', 'customer', 'churned']).optional(),
-  tags: z.array(z.string()).optional(),
   notes: z.string().optional().nullable(),
 });
 
@@ -239,22 +235,20 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
     
     const result = await queryOne<ContactQueryResult>(
       `INSERT INTO contacts (
-        account_id, first_name, last_name, email, phone, mobile,
-        job_title, department, owner_id, lifecycle_stage, tags, notes
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        account_id, first_name, last_name, email, mobile,
+        job_title, department, owner_id, lifecycle_stage, notes
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING *`,
       [
         accountId,
         validatedData.first_name,
         validatedData.last_name,
         validatedData.email || null,
-        validatedData.phone || null,
         validatedData.mobile || null,
         validatedData.job_title || null,
         validatedData.department || null,
         validatedData.owner_id || null,
         validatedData.lifecycle_stage || 'lead',
-        validatedData.tags || [],
         validatedData.notes || null,
       ]
     );

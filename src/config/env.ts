@@ -27,7 +27,9 @@ const envSchema = z.object({
   REDIS_URL: z.string().optional(),
   REDIS_HOST: z.string().default('localhost'),
   REDIS_PORT: z.string().default('6379'),
+  REDIS_USERNAME: z.string().optional(),
   REDIS_PASSWORD: z.string().optional(),
+  REDIS_TLS: z.string().optional(), // Set to 'true' or '1' to enable TLS
 
   // MongoDB
   MONGODB_URI: z.string().optional(),

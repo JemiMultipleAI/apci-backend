@@ -6,7 +6,7 @@ import { z, ZodError } from 'zod';
 import { sendEmailFromTemplate, EmailResult } from '../services/email';
 import { sendSMSFromTemplate, SMSResult } from '../services/sms';
 import { makeVoiceCallFromTemplate, VoiceCallResult } from '../services/voice';
-import { findDormantContacts } from '../services/subscriptionReactivation';
+import { findDormantContacts } from '../services/dormantContacts';
 import { logger } from '../utils/logger';
 import { isSuperAdmin, getUserCompanyId } from '../utils/companyAccess';
 import { env } from '../config/env';
@@ -76,16 +76,17 @@ const channelConfigSchema = z.object({
 const createCampaignSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
-  type: z.enum(['reactivation', 'marketing', 'survey']),
+  type: z.enum(['reactivation', 'marketing', 'survey']).optional(), // Deprecated, kept for backward compatibility
   channel: z.enum(['email', 'sms', 'call', 'multi']),
   status: z.enum(['draft', 'scheduled', 'running', 'paused', 'completed']).optional(),
   start_date: z.string().optional().nullable(),
   end_date: z.string().optional().nullable(),
   metadata: z.object({
-    contact_ids: z.array(z.string().uuid()).optional(),
+    contact_group_ids: z.array(z.string().uuid()).optional(), // Primary method: select by groups
+    contact_ids: z.array(z.string().uuid()).optional(), // Deprecated: backward compatibility
     template_id: z.string().uuid().optional(),
     survey_id: z.string().uuid().optional(),
-    days_inactive: z.number().optional(),
+    days_inactive: z.number().optional(), // Optional: filter groups by dormancy
     channels: z.object({
       email: channelConfigSchema.optional(),
       sms: channelConfigSchema.optional(),
@@ -366,7 +367,7 @@ router.post('/', authenticate, async (req: Request, res: Response, next: NextFun
       [
         validatedData.name,
         validatedData.description || null,
-        validatedData.type,
+        validatedData.type || null, // Optional for backward compatibility
         validatedData.channel,
         validatedData.status || 'draft',
         userId || null,
@@ -714,6 +715,11 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       }
     }
 
+    // Parse campaign metadata once
+    const metadata = typeof campaign.metadata === 'string' 
+      ? JSON.parse(campaign.metadata) 
+      : campaign.metadata;
+
     // Get template
     let template: any = null;
     if (template_id) {
@@ -723,33 +729,24 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       }
     } else {
       // Try to get template from campaign metadata
-      const metadata = typeof campaign.metadata === 'string' 
-        ? JSON.parse(campaign.metadata) 
-        : campaign.metadata;
       if (metadata?.template_id) {
         template = await queryOne('SELECT * FROM templates WHERE id = $1', [metadata.template_id]);
       }
     }
 
-    // For survey campaigns, template is optional (survey link is sent instead)
-    if (!template && campaign.type !== 'survey') {
-      throw createError('Template is required for campaign execution', 400);
+    // Check if survey is specified in metadata
+    
+    let survey: any = null;
+    if (metadata?.survey_id) {
+      survey = await queryOne('SELECT * FROM surveys WHERE id = $1 AND is_active = true', [metadata.survey_id]);
+      if (!survey) {
+        throw createError('Survey not found or not active', 404);
+      }
     }
 
-    // For survey campaigns, get survey from metadata
-    let survey: any = null;
-    if (campaign.type === 'survey') {
-      const metadata = typeof campaign.metadata === 'string' 
-        ? JSON.parse(campaign.metadata) 
-        : campaign.metadata;
-      if (metadata?.survey_id) {
-        survey = await queryOne('SELECT * FROM surveys WHERE id = $1 AND is_active = true', [metadata.survey_id]);
-        if (!survey) {
-          throw createError('Survey not found or not active', 404);
-        }
-      } else {
-        throw createError('Survey ID is required for survey campaigns', 400);
-      }
+    // Template is required if no survey is specified
+    if (!template && !survey) {
+      throw createError('Either template or survey is required for campaign execution', 400);
     }
 
     // Get target contacts with company filtering
@@ -770,13 +767,40 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       
       contacts = await query(contactQuery, contactParams);
     } else {
-      // Get contacts from campaign metadata or subscription reactivation
-      const metadata = typeof campaign.metadata === 'string' 
-        ? JSON.parse(campaign.metadata) 
-        : campaign.metadata;
-      
-      if (campaign.type === 'reactivation' && metadata?.days_inactive) {
-        // Use subscription reactivation service to get dormant contacts
+      // Get contacts from campaign metadata
+      // Priority 1: Contact groups (primary method)
+      if (metadata?.contact_group_ids && metadata.contact_group_ids.length > 0) {
+        let groupQuery = `
+          SELECT DISTINCT c.* 
+          FROM contacts c
+          INNER JOIN contact_group_members cgm ON c.id = cgm.contact_id
+          WHERE cgm.contact_group_id = ANY($1)
+        `;
+        const params: any[] = [metadata.contact_group_ids];
+        
+        // Optional: Filter groups by dormancy if days_inactive is specified
+        if (metadata?.days_inactive) {
+          groupQuery += `
+            AND (
+              SELECT MAX(a.created_at)
+              FROM activities a
+              WHERE a.related_to_type = 'contact' AND a.related_to_id = c.id
+            ) IS NULL
+            OR EXTRACT(DAY FROM (
+              CURRENT_TIMESTAMP - (
+                SELECT MAX(a.created_at)
+                FROM activities a
+                WHERE a.related_to_type = 'contact' AND a.related_to_id = c.id
+              )
+            )) >= $2
+          `;
+          params.push(metadata.days_inactive);
+        }
+        
+        contacts = await query(groupQuery, params);
+      } 
+      // Priority 2: Dormant contacts (if days_inactive specified without groups)
+      else if (metadata?.days_inactive) {
         const daysInactive = metadata.days_inactive || 90;
         const dormantContacts = await findDormantContacts(daysInactive);
         // Convert to full contact objects
@@ -788,14 +812,29 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
             contactIds
           );
         }
-      } else if (metadata?.contact_ids) {
+      }
+      // Priority 3: Individual contact IDs (backward compatibility)
+      else if (metadata?.contact_ids && metadata.contact_ids.length > 0) {
         const placeholders = metadata.contact_ids.map((_: string, index: number) => `$${index + 1}`).join(',');
         contacts = await query(
           `SELECT * FROM contacts WHERE id IN (${placeholders})`,
           metadata.contact_ids
         );
+      } 
+      // Legacy: reactivation type (backward compatibility)
+      else if (campaign.type === 'reactivation' && metadata?.days_inactive) {
+        const daysInactive = metadata.days_inactive || 90;
+        const dormantContacts = await findDormantContacts(daysInactive);
+        if (dormantContacts.length > 0) {
+          const contactIds = dormantContacts.map(c => c.id);
+          const placeholders = contactIds.map((_, index) => `$${index + 1}`).join(',');
+          contacts = await query(
+            `SELECT * FROM contacts WHERE id IN (${placeholders})`,
+            contactIds
+          );
+        }
       } else {
-        throw createError('No contacts specified for campaign execution', 400);
+        throw createError('No contacts specified for campaign execution. Please select contact groups or provide contact IDs.', 400);
       }
     }
 
@@ -818,9 +857,7 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     }
 
     const userId = req.user?.userId;
-    const metadata = typeof campaign.metadata === 'string' 
-      ? JSON.parse(campaign.metadata) 
-      : campaign.metadata;
+    // metadata is already declared at the top of this function
 
     // Get user's company ID for webhook token creation
     const userCompanyId = req.userCompanyId ?? (req.user ? await getUserCompanyId(req.user) : null);
@@ -868,6 +905,9 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
 
     const campaignStartTime = new Date();
 
+    // Collect all job promises first (parallel queuing)
+    const jobPromises: Promise<any>[] = [];
+
     // Prepare template variables for all contacts
     for (const contact of contacts) {
       try {
@@ -876,7 +916,7 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
           first_name: contact.first_name || '',
           last_name: contact.last_name || '',
           email: contact.email || '',
-          phone: contact.phone || contact.mobile || '',
+          mobile: contact.mobile || '',
           full_name: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
         };
 
@@ -890,9 +930,9 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
             results.errors.push(`${contact.first_name} ${contact.last_name}: No email address for ${channel}`);
             continue;
           }
-          if ((channel === 'sms' || channel === 'call') && !contact.phone && !contact.mobile) {
+          if ((channel === 'sms' || channel === 'call') && !contact.mobile) {
             results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: No phone number for ${channel}`);
+            results.errors.push(`${contact.first_name} ${contact.last_name}: No mobile number for ${channel}`);
             continue;
           }
 
@@ -917,32 +957,47 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
             jobData.surveyId = survey.id;
           }
 
-          // Queue the job
-          const job = await campaignQueue.add(
+          // Add job promise to array (don't await yet - queue in parallel)
+          const jobPromise = campaignQueue.add(
             'campaign-message', // Generic name that matches the process handler
             jobData,
             {
               delay: delayMs,
-              jobId: `campaign-${campaign.id}-${channel}-${contact.id}-${Date.now()}`,
+              jobId: `campaign-${campaign.id}-${channel}-${contact.id}-${Date.now()}-${Math.random()}`,
             }
-          );
-
-          results.queued++;
-          results.jobs.push(job.id.toString());
-
-          logger.info('[CAMPAIGN] Queued job', {
-            jobId: job.id,
-            campaignId: campaign.id,
-            contactId: contact.id,
-            channel,
-            scheduledTime: scheduledTime.toISOString(),
+          ).then((job) => {
+            results.queued++;
+            results.jobs.push(job.id.toString());
+            logger.info('[CAMPAIGN] Queued job', {
+              jobId: job.id,
+              campaignId: campaign.id,
+              contactId: contact.id,
+              channel,
+              scheduledTime: scheduledTime.toISOString(),
+            });
+            return job;
+          }).catch((error: any) => {
+            results.failed++;
+            results.errors.push(`${contact.first_name} ${contact.last_name}: ${error.message}`);
+            logger.error('[CAMPAIGN] Failed to queue job', {
+              campaignId: campaign.id,
+              contactId: contact.id,
+              channel,
+              error: error.message,
+            });
+            return null; // Don't throw, just track the error
           });
+
+          jobPromises.push(jobPromise);
         }
       } catch (error: any) {
         results.failed++;
         results.errors.push(`${contact.first_name} ${contact.last_name}: ${error.message}`);
       }
     }
+
+    // Wait for all jobs to be queued in parallel (this should be fast - just adding to Redis)
+    await Promise.allSettled(jobPromises);
 
     // Store job IDs in campaign metadata for tracking
     const updatedMetadata = {
@@ -1048,6 +1103,39 @@ router.get('/:id/status', authenticate, enrichUser, async (req: Request, res: Re
     });
   } catch (error) {
     next(error);
+  }
+});
+
+// GET /api/campaigns/queue/health - Check Redis queue health
+router.get('/queue/health', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Test Redis connection
+    const isReady = await campaignQueue.isReady();
+    const waiting = await campaignQueue.getWaitingCount();
+    const active = await campaignQueue.getActiveCount();
+    const delayed = await campaignQueue.getDelayedCount();
+    const completed = await campaignQueue.getCompletedCount();
+    const failed = await campaignQueue.getFailedCount();
+
+    res.json({
+      success: true,
+      data: {
+        connected: isReady,
+        stats: {
+          waiting,
+          active,
+          delayed,
+          completed,
+          failed,
+        },
+      },
+    });
+  } catch (error: any) {
+    res.json({
+      success: false,
+      error: 'Redis not connected',
+      message: error.message,
+    });
   }
 });
 

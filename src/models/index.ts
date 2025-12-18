@@ -38,13 +38,11 @@ export interface Contact {
   first_name: string;
   last_name: string;
   email: string | null;
-  phone: string | null;
   mobile: string | null;
   job_title: string | null;
   department: string | null;
   owner_id: string | null;
   lifecycle_stage: 'lead' | 'qualified' | 'customer' | 'churned';
-  tags: string[];
   notes: string | null;
   custom_fields: Record<string, any>;
   created_at: Date;
@@ -117,11 +115,22 @@ export interface SurveyResponse {
   created_at: Date;
 }
 
+export interface ContactGroup {
+  id: string;
+  name: string;
+  description: string | null;
+  account_id: string | null;
+  created_by: string | null;
+  created_at: Date;
+  updated_at: Date;
+  member_count?: number; // Computed field
+}
+
 export interface Campaign {
   id: string;
   name: string;
   description: string | null;
-  type: 'reactivation' | 'marketing' | 'survey';
+  type?: 'reactivation' | 'marketing' | 'survey'; // Deprecated, kept for backward compatibility
   channel: 'email' | 'sms' | 'call' | 'multi';
   status: 'draft' | 'scheduled' | 'running' | 'paused' | 'completed';
   created_by: string | null;

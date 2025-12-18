@@ -1,10 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate } from '../middleware/auth';
-import { query } from '../db/connection';
+import { authenticate, enrichUser } from '../middleware/auth';
+import { query, queryOne } from '../db/connection';
 import { createError } from '../middleware/errorHandler';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
+import { getUserCompanyId, isSuperAdmin } from '../utils/companyAccess';
+import { logger } from '../utils/logger';
 
 // Extend Express Request to include multer file
 interface MulterRequest extends Omit<Request, 'file'> {
@@ -37,12 +39,28 @@ const upload = multer({
 router.post(
   '/contacts/import',
   authenticate,
+  enrichUser,
   upload.single('file'),
   async (req: MulterRequest, res: Response, next: NextFunction) => {
     try {
       if (!req.file) {
         throw createError('No file uploaded', 400);
       }
+
+      if (!req.user) {
+        throw createError('Unauthorized', 401);
+      }
+
+      // Get user's company ID for auto-assignment (unless super_admin)
+      let accountId: string | null = null;
+      if (!isSuperAdmin(req.user)) {
+        accountId = await getUserCompanyId(req.user);
+      }
+
+      // Extract group name from filename (remove .csv extension)
+      // Allow override via form data
+      const filename = req.file.originalname.replace(/\.csv$/i, '');
+      const contactGroupName = (req.body.contact_group_name as string)?.trim() || filename;
 
       const csvContent = req.file.buffer.toString('utf-8');
       
@@ -79,20 +97,25 @@ router.post(
         success: 0,
         failed: 0,
         errors: [] as string[],
+        contactIds: [] as string[], // Track successfully imported contact IDs
       };
 
       for (const record of records) {
         try {
-          await query(
+          // Use account_id from CSV if provided, otherwise use user's company
+          const contactAccountId = record.account_id || accountId;
+          
+          const contactResult = await queryOne<{ id: string }>(
             `INSERT INTO contacts (
-              first_name, last_name, email, phone, mobile,
+              account_id, first_name, last_name, email, mobile,
               job_title, department, lifecycle_stage, notes, created_by
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id`,
             [
+              contactAccountId || null,
               record.first_name || '',
               record.last_name || '',
               record.email || null,
-              record.phone || null,
               record.mobile || null,
               record.job_title || null,
               record.department || null,
@@ -101,16 +124,89 @@ router.post(
               req.user?.userId || null,
             ]
           );
-          results.success++;
+          
+          if (contactResult?.id) {
+            results.success++;
+            results.contactIds.push(contactResult.id);
+          }
         } catch (error: any) {
           results.failed++;
           results.errors.push(`Row ${results.total - records.length + 1}: ${error.message}`);
         }
       }
 
+      // Handle contact group assignment (using filename as default)
+      let groupId: string | null = null;
+      if (contactGroupName && results.contactIds.length > 0) {
+        try {
+          // Check if group exists (within company scope)
+          let whereClause = 'WHERE name = $1';
+          const groupParams: any[] = [contactGroupName];
+          
+          if (!isSuperAdmin(req.user!)) {
+            if (accountId) {
+              whereClause += ' AND account_id = $2';
+              groupParams.push(accountId);
+            } else {
+              whereClause += ' AND account_id IS NULL';
+            }
+          }
+
+          let existingGroup = await queryOne<{ id: string }>(
+            `SELECT id FROM contact_groups ${whereClause} LIMIT 1`,
+            groupParams
+          );
+
+          if (existingGroup) {
+            // Use existing group
+            groupId = existingGroup.id;
+          } else {
+            // Create new group
+            const newGroup = await queryOne<{ id: string }>(
+              `INSERT INTO contact_groups (name, description, account_id, created_by)
+               VALUES ($1, $2, $3, $4)
+               RETURNING id`,
+              [
+                contactGroupName,
+                `Auto-created from CSV import on ${new Date().toISOString()}`,
+                accountId || null,
+                req.user?.userId || null,
+              ]
+            );
+            groupId = newGroup?.id || null;
+          }
+
+          // Add all imported contacts to the group
+          if (groupId && results.contactIds.length > 0) {
+            const placeholders = results.contactIds.map((_, index) => 
+              `($1, $${index + 2}, CURRENT_TIMESTAMP, $${results.contactIds.length + 2})`
+            ).join(', ');
+            const values: any[] = [groupId, ...results.contactIds, req.user?.userId || null];
+
+            await query(
+              `INSERT INTO contact_group_members (contact_group_id, contact_id, added_at, added_by)
+               VALUES ${placeholders}
+               ON CONFLICT (contact_id, contact_group_id) DO NOTHING`,
+              values
+            );
+          }
+        } catch (error: any) {
+          // Log error but don't fail the import
+          logger.warn('Failed to assign contacts to group', {
+            groupName: contactGroupName,
+            error: error.message,
+          });
+          results.errors.push(`Warning: Failed to assign contacts to group "${contactGroupName}": ${error.message}`);
+        }
+      }
+
       res.json({
         success: true,
-        data: results,
+        data: {
+          ...results,
+          groupId: groupId || undefined,
+          groupName: contactGroupName || undefined,
+        },
       });
     } catch (error) {
       next(error);
@@ -119,24 +215,43 @@ router.post(
 );
 
 // GET /api/import-export/contacts/export - Export contacts to CSV
-router.get('/contacts/export', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/contacts/export', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { lifecycle_stage, limit } = req.query;
-    
-    let whereClause = '';
-    const params: any[] = [];
-    
-    if (lifecycle_stage) {
-      whereClause = 'WHERE lifecycle_stage = $1';
-      params.push(lifecycle_stage);
+    if (!req.user) {
+      throw createError('Unauthorized', 401);
     }
 
-    const limitClause = limit ? `LIMIT $${params.length + 1}` : '';
-    if (limit) params.push(parseInt(limit as string));
+    const { lifecycle_stage, limit } = req.query;
+    
+    let whereClause = 'WHERE 1=1';
+    const params: any[] = [];
+    let paramIndex = 1;
+    
+    // Apply company filter for non-super_admin users
+    if (!isSuperAdmin(req.user)) {
+      const userCompanyId = await getUserCompanyId(req.user);
+      if (userCompanyId) {
+        whereClause += ` AND account_id = $${paramIndex}`;
+        params.push(userCompanyId);
+        paramIndex++;
+      }
+    }
+    
+    if (lifecycle_stage) {
+      whereClause += ` AND lifecycle_stage = $${paramIndex}`;
+      params.push(lifecycle_stage);
+      paramIndex++;
+    }
+
+    const limitClause = limit ? `LIMIT $${paramIndex}` : '';
+    if (limit) {
+      params.push(parseInt(limit as string));
+      paramIndex++;
+    }
 
     const contacts = await query(
       `SELECT 
-        first_name, last_name, email, phone, mobile,
+        first_name, last_name, email, mobile,
         job_title, department, lifecycle_stage, notes,
         created_at, updated_at
       FROM contacts ${whereClause} ORDER BY created_at DESC ${limitClause}`,
@@ -145,7 +260,7 @@ router.get('/contacts/export', authenticate, async (req: Request, res: Response,
 
     // Generate CSV using csv-stringify
     const columns = [
-      'first_name', 'last_name', 'email', 'phone', 'mobile',
+      'first_name', 'last_name', 'email', 'mobile',
       'job_title', 'department', 'lifecycle_stage', 'notes',
       'created_at', 'updated_at'
     ];

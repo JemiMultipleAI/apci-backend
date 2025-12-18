@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, enrichUser } from '../middleware/auth';
-import { findDormantContacts, calculateSubscriptionReactivationScore, getSubscriptionReactivationStats } from '../services/subscriptionReactivation';
+import { findDormantContacts, calculateDormantContactScore, getDormantContactStats, calculateSubscriptionReactivationScore, getSubscriptionReactivationStats } from '../services/dormantContacts';
 import { createError } from '../middleware/errorHandler';
 import { z } from 'zod';
 import { isSuperAdmin, getUserCompanyId } from '../utils/companyAccess';
@@ -13,7 +13,7 @@ import { createWebhookToken, generateReplyToEmail } from '../services/webhookTok
 
 const router = Router();
 
-// GET /api/subscription-reactivation/dormant - Find dormant contacts
+// GET /api/dormant-contacts/dormant - Find dormant contacts
 router.get('/dormant', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
@@ -48,7 +48,7 @@ router.get('/dormant', authenticate, enrichUser, async (req: Request, res: Respo
   }
 });
 
-// GET /api/subscription-reactivation/score/:contactId - Get subscription reactivation score for a contact
+// GET /api/dormant-contacts/score/:contactId - Get dormant contact score for a contact
 router.get('/score/:contactId', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
@@ -80,7 +80,7 @@ router.get('/score/:contactId', authenticate, enrichUser, async (req: Request, r
       }
     }
 
-    const score = await calculateSubscriptionReactivationScore(contactId);
+    const score = await calculateDormantContactScore(contactId);
 
     res.json({
       success: true,
@@ -91,7 +91,7 @@ router.get('/score/:contactId', authenticate, enrichUser, async (req: Request, r
   }
 });
 
-// GET /api/subscription-reactivation/stats/:campaignId - Get subscription reactivation campaign statistics
+// GET /api/dormant-contacts/stats/:campaignId - Get dormant contact campaign statistics
 router.get('/stats/:campaignId', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
@@ -130,7 +130,7 @@ router.get('/stats/:campaignId', authenticate, enrichUser, async (req: Request, 
       }
     }
 
-    const stats = await getSubscriptionReactivationStats(campaignId);
+    const stats = await getDormantContactStats(campaignId);
 
     const reactivationRate = stats.totalContacts > 0
       ? stats.reactivated / stats.totalContacts
@@ -148,7 +148,7 @@ router.get('/stats/:campaignId', authenticate, enrichUser, async (req: Request, 
   }
 });
 
-// POST /api/subscription-reactivation/reactivate - Reactivate one or more contacts
+// POST /api/dormant-contacts/reactivate - Reactivate one or more contacts
 const reactivateSchema = z.object({
   contact_ids: z.array(z.string().uuid()).min(1, 'At least one contact ID is required'),
   template_id: z.string().uuid().optional(),
@@ -170,7 +170,7 @@ router.post('/reactivate', authenticate, enrichUser, async (req: Request, res: R
 
     // Verify all contacts exist and user has access
     const placeholders = validatedData.contact_ids.map((_, index) => `$${index + 1}`).join(',');
-    let contactQuery = `SELECT id, first_name, last_name, email, phone, account_id FROM contacts WHERE id IN (${placeholders})`;
+    let contactQuery = `SELECT id, first_name, last_name, email, mobile, account_id FROM contacts WHERE id IN (${placeholders})`;
     const contactParams = [...validatedData.contact_ids];
 
     // Apply company filtering for non-super_admin users
@@ -395,14 +395,14 @@ router.post('/reactivate', authenticate, enrichUser, async (req: Request, res: R
         }
 
         if (validatedData.channel === 'sms' || validatedData.channel === 'multi') {
-          if (!contact.phone) {
+          if (!contact.mobile) {
             if (validatedData.channel === 'sms') {
               results.failed++;
-              results.errors.push(`${contact.first_name} ${contact.last_name}: No phone number`);
+              results.errors.push(`${contact.first_name} ${contact.last_name}: No mobile number`);
               continue;
             }
           } else {
-            const smsResult = await sendSMSFromTemplate(contact.phone, body, variables);
+            const smsResult = await sendSMSFromTemplate(contact.mobile, body, variables);
             if (smsResult.success) {
               success = true;
               activityType = validatedData.channel === 'multi' ? 'sms' : 'sms';
@@ -420,13 +420,13 @@ router.post('/reactivate', authenticate, enrichUser, async (req: Request, res: R
         }
 
         if (validatedData.channel === 'call') {
-          if (!contact.phone) {
+          if (!contact.mobile) {
             results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: No phone number`);
+            results.errors.push(`${contact.first_name} ${contact.last_name}: No mobile number`);
             continue;
           }
 
-          const callResult = await makeVoiceCallFromTemplate(contact.phone, body, variables);
+          const callResult = await makeVoiceCallFromTemplate(contact.mobile, body, variables);
           if (callResult.success) {
             success = true;
             activityType = 'call';

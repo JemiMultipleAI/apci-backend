@@ -14,7 +14,8 @@ import authRouter from './routes/auth';
 import usersRouter from './routes/users';
 import surveysRouter from './routes/surveys';
 import campaignsRouter from './routes/campaigns';
-import subscriptionReactivationRouter from './routes/subscription-reactivation';
+import dormantContactsRouter from './routes/dormant-contacts';
+import contactGroupsRouter from './routes/contact-groups';
 import analyticsRouter from './routes/analytics';
 import aiRouter from './routes/ai';
 import templatesRouter from './routes/templates';
@@ -120,7 +121,8 @@ app.use('/api/activities', activitiesRouter);
 // Agent routes
 app.use('/api/surveys', surveysRouter);
 app.use('/api/campaigns', campaignsRouter);
-app.use('/api/subscription-reactivation', subscriptionReactivationRouter);
+app.use('/api/dormant-contacts', dormantContactsRouter);
+app.use('/api/contact-groups', contactGroupsRouter);
 
 // Analytics & AI routes
 app.use('/api/analytics', analyticsRouter);

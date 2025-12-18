@@ -1,8 +1,8 @@
 import { query, queryOne } from '../db/connection';
 
 /**
- * Subscription Reactivation Service
- * Identifies dormant contacts and manages subscription reactivation campaigns
+ * Dormant Contacts Service
+ * Identifies dormant contacts (contacts with no activity in N days)
  */
 
 export interface DormantContact {
@@ -10,7 +10,7 @@ export interface DormantContact {
   first_name: string;
   last_name: string;
   email: string | null;
-  phone: string | null;
+  mobile: string | null;
   account_id: string | null;
   last_activity_date: Date | null;
   days_since_activity: number;
@@ -27,7 +27,7 @@ export const findDormantContacts = async (daysInactive: number = 90): Promise<Do
       c.first_name,
       c.last_name,
       c.email,
-      c.phone,
+      c.mobile,
       c.account_id,
       MAX(a.created_at) as last_activity_date,
       EXTRACT(DAY FROM (CURRENT_TIMESTAMP - MAX(a.created_at)))::INTEGER as days_since_activity,
@@ -40,7 +40,7 @@ export const findDormantContacts = async (daysInactive: number = 90): Promise<Do
       (a.related_to_type = 'contact' AND a.related_to_id = c.id)
     )
     WHERE c.lifecycle_stage != 'churned'
-    GROUP BY c.id, c.first_name, c.last_name, c.email, c.phone, c.account_id
+    GROUP BY c.id, c.first_name, c.last_name, c.email, c.mobile, c.account_id
     HAVING MAX(a.created_at) IS NULL 
        OR EXTRACT(DAY FROM (CURRENT_TIMESTAMP - MAX(a.created_at)))::INTEGER >= $1
     ORDER BY reactivation_score DESC
@@ -52,9 +52,9 @@ export const findDormantContacts = async (daysInactive: number = 90): Promise<Do
 };
 
 /**
- * Calculate subscription reactivation score for a contact
+ * Calculate dormant contact score for a contact
  */
-export const calculateSubscriptionReactivationScore = async (contactId: string): Promise<number> => {
+export const calculateDormantContactScore = async (contactId: string): Promise<number> => {
   const contact = await queryOne<{
     lifecycle_stage: string;
     last_activity: Date | null;
@@ -92,9 +92,9 @@ export const calculateSubscriptionReactivationScore = async (contactId: string):
 };
 
 /**
- * Get subscription reactivation campaign statistics
+ * Get dormant contact campaign statistics
  */
-export const getSubscriptionReactivationStats = async (campaignId: string) => {
+export const getDormantContactStats = async (campaignId: string) => {
   const stats = await queryOne<{
     total_contacts: string;
     contacted: string;
@@ -128,4 +128,8 @@ export const getSubscriptionReactivationStats = async (campaignId: string) => {
     reactivated: parseInt(stats?.reactivated || '0', 10),
   };
 };
+
+// Backward compatibility exports
+export const calculateSubscriptionReactivationScore = calculateDormantContactScore;
+export const getSubscriptionReactivationStats = getDormantContactStats;
 

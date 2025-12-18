@@ -71,12 +71,22 @@ async function checkCampaignCompletion(campaignId: string): Promise<void> {
 }
 
 // Redis connection configuration
-const redisConfig = {
-  host: env.REDIS_HOST || 'localhost',
-  port: parseInt(env.REDIS_PORT || '6379', 10),
-  password: env.REDIS_PASSWORD,
-  ...(env.REDIS_URL && { url: env.REDIS_URL }),
-};
+// Use connection object for better control (especially for Redis Cloud with username/TLS)
+const redisConfig: any = env.REDIS_URL 
+  ? env.REDIS_URL // Use URL if provided (for backward compatibility)
+  : {
+      host: env.REDIS_HOST || 'localhost',
+      port: parseInt(env.REDIS_PORT || '6379', 10),
+      ...(env.REDIS_USERNAME && { username: env.REDIS_USERNAME }),
+      ...(env.REDIS_PASSWORD && { password: env.REDIS_PASSWORD }),
+      // Only enable TLS if explicitly requested via REDIS_TLS environment variable
+      ...(env.REDIS_TLS === 'true' || env.REDIS_TLS === '1'
+        ? { tls: { rejectUnauthorized: false } }
+        : {}),
+      // Required for Bull queue
+      maxRetriesPerRequest: null,
+      enableReadyCheck: false,
+    };
 
 // Create campaign queue
 export const campaignQueue = new Bull('campaign-messages', {
@@ -191,13 +201,13 @@ campaignQueue.process('campaign-message', async (job) => {
           throw new Error(result.error || 'Failed to send email');
         }
       } else if (channel === 'sms') {
-        if (!contact.phone && !contact.mobile) {
-          throw new Error('Contact has no phone number');
+        if (!contact.mobile) {
+          throw new Error('Contact has no mobile number');
         }
 
         const surveySMSBody = `Hi ${contact.first_name}, please take our survey: ${surveyLink}`;
         result = await sendSMSFromTemplate(
-          contact.phone || contact.mobile,
+          contact.mobile,
           surveySMSBody,
           { ...variables, survey_link: surveyLink }
         );
@@ -209,14 +219,14 @@ campaignQueue.process('campaign-message', async (job) => {
           throw new Error(result.error || 'Failed to send SMS');
         }
       } else if (channel === 'call') {
-        if (!contact.phone && !contact.mobile) {
-          throw new Error('Contact has no phone number');
+        if (!contact.mobile) {
+          throw new Error('Contact has no mobile number');
         }
 
         const surveyCallScript = `Hi ${contact.first_name}, we'd love to hear your feedback! Please visit ${surveyLink} to complete our survey. Thank you!`;
         
         result = await makeVoiceCallFromTemplate(
-          contact.phone || contact.mobile,
+          contact.mobile,
           surveyCallScript,
           { ...variables, survey_link: surveyLink }
         );
@@ -257,12 +267,12 @@ campaignQueue.process('campaign-message', async (job) => {
           throw new Error(result.error || 'Failed to send email');
         }
       } else if (channel === 'sms') {
-        if (!contact.phone && !contact.mobile) {
-          throw new Error('Contact has no phone number');
+        if (!contact.mobile) {
+          throw new Error('Contact has no mobile number');
         }
 
         result = await sendSMSFromTemplate(
-          contact.phone || contact.mobile,
+          contact.mobile,
           template.body,
           variables
         );
@@ -274,12 +284,12 @@ campaignQueue.process('campaign-message', async (job) => {
           throw new Error(result.error || 'Failed to send SMS');
         }
       } else if (channel === 'call') {
-        if (!contact.phone && !contact.mobile) {
-          throw new Error('Contact has no phone number');
+        if (!contact.mobile) {
+          throw new Error('Contact has no mobile number');
         }
 
         result = await makeVoiceCallFromTemplate(
-          contact.phone || contact.mobile,
+          contact.mobile,
           template.body,
           variables
         );
@@ -299,7 +309,7 @@ campaignQueue.process('campaign-message', async (job) => {
     const metadata: any = {
       campaign_id: campaignId,
       campaign_name: campaign.name,
-      campaign_type: campaign.type,
+      ...(campaign.type && { campaign_type: campaign.type }), // Deprecated, kept for backward compatibility
       campaign_channel: channel,
       ...(surveyId && { survey_id: surveyId }),
       ...(templateId && { template_id: templateId }),
@@ -423,6 +433,33 @@ campaignQueue.on('failed', (job, err) => {
     jobId: job?.id,
     error: err.message,
   });
+});
+
+// Redis connection event handlers
+campaignQueue.on('error', (error) => {
+  logger.error('[CAMPAIGN_QUEUE] Redis connection error', {
+    error: error.message,
+    stack: error.stack,
+  });
+});
+
+campaignQueue.on('waiting', (jobId) => {
+  logger.debug('[CAMPAIGN_QUEUE] Job waiting', { jobId });
+});
+
+// Test Redis connection on startup
+campaignQueue.isReady().then(() => {
+  logger.info('[CAMPAIGN_QUEUE] Redis connected and queue ready', {
+    host: redisConfig.host,
+    port: redisConfig.port,
+  });
+}).catch((error) => {
+  logger.error('[CAMPAIGN_QUEUE] Failed to connect to Redis', {
+    error: error.message,
+    host: redisConfig.host,
+    port: redisConfig.port,
+  });
+  logger.warn('[CAMPAIGN_QUEUE] Campaign execution will fail without Redis. Please ensure Redis is running.');
 });
 
 // Helper function to calculate delay in milliseconds

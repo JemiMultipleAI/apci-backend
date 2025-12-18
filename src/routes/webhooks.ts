@@ -766,8 +766,7 @@ router.post('/inbound/sms/:token', async (req: Request, res: Response, next: Nex
       const contact = await queryOne<{ id: string }>(
         `SELECT id FROM contacts 
          WHERE account_id = $1 
-         AND (regexp_replace(regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g'), '^1', '') = $2
-            OR regexp_replace(regexp_replace(COALESCE(mobile, ''), '[^0-9]', '', 'g'), '^1', '') = $2)
+         AND regexp_replace(regexp_replace(COALESCE(mobile, ''), '[^0-9]', '', 'g'), '^1', '') = $2
          LIMIT 1`,
         [tokenData.account_id, normalizedPhone]
       );
@@ -862,8 +861,7 @@ router.post('/inbound/sms', async (req: Request, res: Response, next: NextFuncti
     }>(
       `SELECT c.id, c.account_id, c.first_name, c.last_name
        FROM contacts c
-       WHERE (regexp_replace(regexp_replace(COALESCE(c.phone, ''), '[^0-9]', '', 'g'), '^1', '') = $1
-          OR regexp_replace(regexp_replace(COALESCE(c.mobile, ''), '[^0-9]', '', 'g'), '^1', '') = $1)
+       WHERE regexp_replace(regexp_replace(COALESCE(c.mobile, ''), '[^0-9]', '', 'g'), '^1', '') = $1
        LIMIT 1`,
       [normalizedPhone]
     );
