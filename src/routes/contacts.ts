@@ -26,13 +26,63 @@ interface ContactQueryResult {
 
 const router = Router();
 
+// Helper function to normalize and validate mobile numbers
+// Format: Must start with 61 followed by exactly 9 digits (11 digits total)
+const normalizeMobile = (mobile: string | null | undefined): string | null => {
+  if (!mobile || mobile.trim() === '') return null;
+  
+  // Remove all non-digit characters
+  const digitsOnly = mobile.replace(/\D/g, '');
+  
+  // If empty after removing non-digits, return null
+  if (digitsOnly.length === 0) return null;
+  
+  // If it starts with 0, replace with 61
+  if (digitsOnly.startsWith('0')) {
+    const withoutZero = digitsOnly.substring(1);
+    if (withoutZero.length === 9) {
+      return '61' + withoutZero;
+    }
+  }
+  
+  // If it starts with +61 (becomes 6161 after removing +), fix it
+  if (digitsOnly.startsWith('6161') && digitsOnly.length === 13) {
+    return '61' + digitsOnly.substring(2);
+  }
+  
+  // If it already starts with 61, return as is
+  if (digitsOnly.startsWith('61')) {
+    return digitsOnly;
+  }
+  
+  // If it's 9 digits (local number), add 61 prefix
+  if (digitsOnly.length === 9) {
+    return '61' + digitsOnly;
+  }
+  
+  // Return as is (will be validated)
+  return digitsOnly;
+};
+
 // Validation schemas
 const createContactSchema = z.object({
   account_id: z.string().uuid().optional().nullable(),
   first_name: z.string().min(1),
   last_name: z.string().min(1),
   email: z.string().email().optional().nullable(),
-  mobile: z.string().optional().nullable(),
+  mobile: z.string()
+    .optional()
+    .nullable()
+    .refine((val) => {
+      if (!val || val.trim() === '') return true; // Allow null/empty
+      const normalized = normalizeMobile(val);
+      if (!normalized) return true; // Allow empty after normalization
+      // Must be exactly 11 digits starting with 61
+      return /^61\d{9}$/.test(normalized);
+    }, {
+      message: 'Mobile number must start with 61 followed by 9 digits (e.g., 61412345678). Do not use 0 or +61.',
+    })
+    .transform((val) => normalizeMobile(val)), // Normalize the value
   job_title: z.string().optional().nullable(),
   department: z.string().optional().nullable(),
   owner_id: z.string().uuid().optional().nullable(),
