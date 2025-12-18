@@ -116,13 +116,20 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
           url: mediaStreamUrlWithParams,
         });
 
-        // Optional: Add a greeting while connecting
+        // Play template message first (if provided), then agent takes over
         if (options.script) {
           twiml.say({
             voice: 'alice',
             language: 'en-US',
           }, options.script);
         }
+
+        // CRITICAL: Add a long pause to keep the call alive while Media Stream is active
+        // The call will stay open as long as the Media Stream WebSocket is connected
+        // This allows the template to play first, then the agent takes over for conversation
+        twiml.pause({
+          length: 3600, // 1 hour (max) - call will end when stream disconnects anyway
+        });
 
         const call = await client.calls.create({
           twiml: twiml.toString(),

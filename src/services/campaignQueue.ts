@@ -343,11 +343,13 @@ campaignQueue.process('campaign-message', async (job) => {
 
         // Use agent if available, otherwise use simple TTS
         const useAgent = !!agentId;
-        const callScript = useAgent ? undefined : replaceTemplateVariables(template.body, variables);
+        // For agent calls, play template first as introduction, then agent takes over
+        // For non-agent calls, use template as the full script
+        const callScript = replaceTemplateVariables(template.body, variables);
 
         result = await makeVoiceCallFromTemplate(
           contact.mobile,
-          callScript || template.body, // Script is optional for agent calls
+          callScript, // Always pass script - plays first for agent calls, full script for non-agent calls
           variables,
           undefined, // from
           undefined, // voiceId

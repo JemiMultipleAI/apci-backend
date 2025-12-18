@@ -673,7 +673,7 @@ async function findContactByEmailOrPhone(
   const contact = await queryOne<{ id: string }>(
     `SELECT id FROM contacts 
      WHERE account_id = $1 
-     AND (email = $2 OR phone = $2 OR mobile = $2) 
+     AND (email = $2 OR mobile = $2) 
      LIMIT 1`,
     [accountId, emailOrPhone]
   );

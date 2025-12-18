@@ -90,10 +90,11 @@ export async function startVoiceCallBridge(
   }
 
   // Send initial greeting message to agent
+  // Note: Template message plays first via TwiML, then agent takes over
   try {
     const greeting = await sendMessageToAgent(
       agentId,
-      'Hello, I am calling you. Please introduce yourself and ask how you can help.',
+      'The caller has just heard an introduction message. Please acknowledge and continue the conversation naturally.',
       undefined, // agentConfigId
       contactId,
       accountId
