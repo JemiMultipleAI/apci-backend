@@ -447,19 +447,62 @@ campaignQueue.on('waiting', (jobId) => {
   logger.debug('[CAMPAIGN_QUEUE] Job waiting', { jobId });
 });
 
-// Test Redis connection on startup
+// Helper function to get connection info for logging
+function getRedisConnectionInfo(): Record<string, any> {
+  if (typeof redisConfig === 'string') {
+    // REDIS_URL format - mask password for security
+    const maskedUrl = redisConfig.replace(/\/\/([^:]+):([^@]+)@/, '//$1:***@');
+    return { type: 'URL', url: maskedUrl };
+  } else {
+    return {
+      type: 'Connection',
+      host: redisConfig.host || 'localhost',
+      port: redisConfig.port || 6379,
+    };
+  }
+}
+
+// Export function to initialize Redis connection (called during server startup)
+export async function initializeRedisConnection(): Promise<void> {
+  try {
+    const isReady = await Promise.race([
+      campaignQueue.isReady(),
+      new Promise<boolean>((_, reject) =>
+        setTimeout(() => reject(new Error('Redis connection timeout after 10 seconds')), 10000)
+      ),
+    ]);
+
+    if (isReady) {
+      const connectionInfo = getRedisConnectionInfo();
+      logger.info('[CAMPAIGN_QUEUE] Redis connected and queue ready', connectionInfo);
+      console.log('✅ Redis connected successfully');
+    } else {
+      throw new Error('Redis queue is not ready');
+    }
+  } catch (error: any) {
+    const connectionInfo = getRedisConnectionInfo();
+    logger.error('[CAMPAIGN_QUEUE] Failed to connect to Redis', {
+      ...connectionInfo,
+      error: error.message,
+      stack: error.stack,
+    });
+    logger.warn('[CAMPAIGN_QUEUE] Campaign execution will fail without Redis. Please ensure Redis is running.');
+    console.error('❌ Redis connection failed:', error.message);
+    console.warn('⚠️  Campaign execution will not work without Redis');
+    // Don't throw - allow server to start but campaigns won't work
+  }
+}
+
+// Also keep the async check for backward compatibility (runs in background)
 campaignQueue.isReady().then(() => {
-  logger.info('[CAMPAIGN_QUEUE] Redis connected and queue ready', {
-    host: redisConfig.host,
-    port: redisConfig.port,
-  });
+  const connectionInfo = getRedisConnectionInfo();
+  logger.info('[CAMPAIGN_QUEUE] Redis connection verified (async)', connectionInfo);
 }).catch((error) => {
-  logger.error('[CAMPAIGN_QUEUE] Failed to connect to Redis', {
+  const connectionInfo = getRedisConnectionInfo();
+  logger.error('[CAMPAIGN_QUEUE] Redis connection check failed (async)', {
+    ...connectionInfo,
     error: error.message,
-    host: redisConfig.host,
-    port: redisConfig.port,
   });
-  logger.warn('[CAMPAIGN_QUEUE] Campaign execution will fail without Redis. Please ensure Redis is running.');
 });
 
 // Helper function to calculate delay in milliseconds

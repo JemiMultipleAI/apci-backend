@@ -27,6 +27,7 @@ import knowledgeBaseRouter from './routes/knowledge-base';
 import { connectMongoDB, disconnectMongoDB } from './db/mongodb';
 // Import campaign queue to initialize workers
 import './services/campaignQueue';
+import { initializeRedisConnection } from './services/campaignQueue';
 import { query } from './db/connection';
 
 const app = express();
@@ -157,6 +158,9 @@ const startServer = async () => {
   try {
     // Test database connection
     await testConnection();
+    
+    // Initialize Redis connection (with timeout, non-blocking)
+    await initializeRedisConnection();
     
     // Connect to MongoDB (optional, will warn if not configured)
     await connectMongoDB().catch((error) => {
