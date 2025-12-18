@@ -3,7 +3,7 @@ import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { sendEmailFromTemplate } from './email';
 import { sendSMSFromTemplate } from './sms';
-import { makeVoiceCallFromTemplate } from './voice';
+import { makeVoiceCallFromTemplate, replaceTemplateVariables } from './voice';
 import { query, queryOne } from '../db/connection';
 import { createWebhookToken, generateReplyToEmail } from './webhookTokens';
 
@@ -223,17 +223,49 @@ campaignQueue.process('campaign-message', async (job) => {
           throw new Error('Contact has no mobile number');
         }
 
+        // Try to get agent config for the account
+        let agentId: string | undefined;
+        if (accountId) {
+          try {
+            const agentConfig = await queryOne<{ agent_id: string }>(
+              `SELECT agent_id FROM ai_agent_configurations 
+               WHERE account_id = $1 AND is_active = true 
+               LIMIT 1`,
+              [accountId]
+            );
+            if (agentConfig) {
+              agentId = agentConfig.agent_id;
+            }
+          } catch (error: any) {
+            logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config for survey call, using simple TTS', {
+              accountId,
+              error: error.message,
+            });
+          }
+        }
+
         const surveyCallScript = `Hi ${contact.first_name}, we'd love to hear your feedback! Please visit ${surveyLink} to complete our survey. Thank you!`;
+        
+        // Use agent if available, otherwise use simple TTS
+        const useAgent = !!agentId;
         
         result = await makeVoiceCallFromTemplate(
           contact.mobile,
-          surveyCallScript,
-          { ...variables, survey_link: surveyLink }
+          useAgent ? undefined : surveyCallScript, // Script optional for agent calls
+          { ...variables, survey_link: surveyLink },
+          undefined, // from
+          undefined, // voiceId
+          agentId,
+          contactId,
+          accountId,
+          useAgent
         );
 
         if (result.success) {
           activityType = 'survey';
-          activityDescription = `Made call for survey: ${survey.name}`;
+          activityDescription = useAgent
+            ? `Made AI agent call for survey: ${survey.name}`
+            : `Made call for survey: ${survey.name}`;
         } else {
           throw new Error(result.error || 'Failed to make voice call');
         }
@@ -288,15 +320,48 @@ campaignQueue.process('campaign-message', async (job) => {
           throw new Error('Contact has no mobile number');
         }
 
+        // Try to get agent config for the account
+        let agentId: string | undefined;
+        if (accountId) {
+          try {
+            const agentConfig = await queryOne<{ agent_id: string }>(
+              `SELECT agent_id FROM ai_agent_configurations 
+               WHERE account_id = $1 AND is_active = true 
+               LIMIT 1`,
+              [accountId]
+            );
+            if (agentConfig) {
+              agentId = agentConfig.agent_id;
+            }
+          } catch (error: any) {
+            logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config, using simple TTS call', {
+              accountId,
+              error: error.message,
+            });
+          }
+        }
+
+        // Use agent if available, otherwise use simple TTS
+        const useAgent = !!agentId;
+        const callScript = useAgent ? undefined : replaceTemplateVariables(template.body, variables);
+
         result = await makeVoiceCallFromTemplate(
           contact.mobile,
-          template.body,
-          variables
+          callScript || template.body, // Script is optional for agent calls
+          variables,
+          undefined, // from
+          undefined, // voiceId
+          agentId,
+          contactId,
+          accountId,
+          useAgent
         );
 
         if (result.success) {
           activityType = 'call';
-          activityDescription = `Made call: ${template.name}`;
+          activityDescription = useAgent 
+            ? `Made AI agent call: ${template.name}` 
+            : `Made call: ${template.name}`;
         } else {
           throw new Error(result.error || 'Failed to make voice call');
         }

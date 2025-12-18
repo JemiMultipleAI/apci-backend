@@ -17,6 +17,8 @@ import {
 import { isSuperAdmin, getUserCompanyId } from '../utils/companyAccess';
 import { processInboundMessage, processInboundMessageByContact } from '../services/inboundMessageProcessor';
 import { env } from '../config/env';
+import { handleMediaStreamConnection } from '../services/twilioMediaStreams';
+import WebSocket from 'ws';
 
 /**
  * Fetch email content from Resend API using email_id
@@ -1009,6 +1011,31 @@ router.post('/inbound/sms', async (req: Request, res: Response, next: NextFuncti
     res.status(200).json({ success: false, error: 'Internal error processing SMS' });
   }
 });
+
+// Export function to setup WebSocket server for Media Streams
+// This needs to be called from the main server file
+export function setupMediaStreamsWebSocket(server: any): void {
+  const wss = new WebSocket.Server({
+    server,
+    path: '/api/webhooks/twilio/media-streams',
+  });
+
+  wss.on('connection', (ws: WebSocket, req: any) => {
+    logger.info('[MEDIA_STREAM] New WebSocket connection attempt', {
+      url: req.url,
+      headers: req.headers,
+    });
+    handleMediaStreamConnection(ws, req);
+  });
+
+  wss.on('error', (error: Error) => {
+    logger.error('[MEDIA_STREAM] WebSocket server error', {
+      error: error.message,
+    });
+  });
+
+  logger.info('[MEDIA_STREAM] WebSocket server started on /api/webhooks/twilio/media-streams');
+}
 
 export default router;
 

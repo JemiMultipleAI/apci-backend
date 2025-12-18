@@ -21,7 +21,7 @@ import aiRouter from './routes/ai';
 import templatesRouter from './routes/templates';
 import importExportRouter from './routes/import-export';
 import bulkOperationsRouter from './routes/bulk-operations';
-import webhooksRouter from './routes/webhooks';
+import webhooksRouter, { setupMediaStreamsWebSocket } from './routes/webhooks';
 import aiAgentConfigsRouter from './routes/ai-agent-configs';
 import knowledgeBaseRouter from './routes/knowledge-base';
 import { connectMongoDB, disconnectMongoDB } from './db/mongodb';
@@ -167,10 +167,13 @@ const startServer = async () => {
       console.warn('⚠️  MongoDB connection failed (optional):', error.message);
     });
     
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`📡 API: ${env.API_BASE_URL}`);
       console.log(`🌍 Environment: ${env.NODE_ENV}`);
+      
+      // Setup WebSocket server for Twilio Media Streams
+      setupMediaStreamsWebSocket(server);
     });
   } catch (error) {
     console.error('Failed to start server:', error);

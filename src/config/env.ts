@@ -47,6 +47,11 @@ const envSchema = z.object({
   VOICE_PROVIDER: z.enum(['elevenlabs', 'twilio']).optional(),
   ELEVENLABS_API_KEY: z.string().optional(),
   ELEVENLABS_VOICE_ID: z.string().optional(),
+  // STT Service (Speech-to-Text)
+  STT_PROVIDER: z.enum(['elevenlabs', 'deepgram', 'google', 'twilio']).optional(),
+  DEEPGRAM_API_KEY: z.string().optional(),
+  GOOGLE_CLOUD_PROJECT_ID: z.string().optional(),
+  GOOGLE_APPLICATION_CREDENTIALS: z.string().optional(),
 
   // Email Service
   EMAIL_PROVIDER: z.enum(['sendgrid', 'resend']).optional(),

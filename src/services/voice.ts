@@ -5,9 +5,13 @@ const { ElevenLabsClient } = require('elevenlabs');
 
 export interface VoiceCallOptions {
   to: string;
-  script: string;
+  script?: string; // Optional for agent calls
   from?: string;
   voiceId?: string;
+  agentId?: string; // ElevenLabs agent ID for conversational calls
+  contactId?: string; // Contact ID for context
+  accountId?: string; // Account ID for agent config lookup
+  useAgent?: boolean; // Whether to use agent (Media Streams) or simple TTS
 }
 
 export interface VoiceCallResult {
@@ -61,11 +65,13 @@ const generateAudioFromText = async (
 
 /**
  * Make voice call using configured provider
+ * If useAgent is true, connects call to ElevenLabs agent via Media Streams
  */
 export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCallResult> => {
   const provider = env.VOICE_PROVIDER || 'twilio';
   const fromNumber = options.from || env.TWILIO_PHONE_NUMBER;
   const voiceId = options.voiceId || env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+  const useAgent = options.useAgent || false;
 
   try {
     if (provider === 'twilio') {
@@ -79,8 +85,64 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
 
       const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
 
-      // If using ElevenLabs for voice synthesis
-      if (env.ELEVENLABS_API_KEY) {
+      // If using agent (Media Streams for real-time conversation)
+      if (useAgent && options.agentId) {
+        if (!env.PUBLIC_WEBHOOK_URL) {
+          throw new Error('PUBLIC_WEBHOOK_URL is required for agent calls (Media Streams)');
+        }
+
+        // Build Media Streams URL
+        const mediaStreamUrl = `${env.PUBLIC_WEBHOOK_URL}/api/webhooks/twilio/media-streams`;
+        
+        // Build custom parameters to pass to Media Streams
+        const customParams: Record<string, string> = {
+          agent_id: options.agentId,
+        };
+        if (options.contactId) {
+          customParams.contact_id = options.contactId;
+        }
+        if (options.accountId) {
+          customParams.account_id = options.accountId;
+        }
+
+        // Create TwiML with Media Streams
+        // Note: Twilio Media Streams passes custom parameters via query string in the WebSocket URL
+        const params = new URLSearchParams(customParams);
+        const mediaStreamUrlWithParams = `${mediaStreamUrl}?${params.toString()}`;
+        
+        const twiml = new twilio.twiml.VoiceResponse();
+        const start = twiml.start();
+        start.stream({
+          url: mediaStreamUrlWithParams,
+        });
+
+        // Optional: Add a greeting while connecting
+        if (options.script) {
+          twiml.say({
+            voice: 'alice',
+            language: 'en-US',
+          }, options.script);
+        }
+
+        const call = await client.calls.create({
+          twiml: twiml.toString(),
+          to: options.to,
+          from: fromNumber,
+        });
+
+        return {
+          success: true,
+          callId: call.sid,
+        };
+      }
+
+      // Fallback: Simple TTS call (non-agent)
+      if (!options.script) {
+        throw new Error('Script is required for non-agent calls');
+      }
+
+      // If using ElevenLabs for voice synthesis (non-streaming)
+      if (env.ELEVENLABS_API_KEY && !useAgent) {
         try {
           // Generate audio from text
           const audioBuffer = await generateAudioFromText(options.script, voiceId);
@@ -150,18 +212,26 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
  */
 export const makeVoiceCallFromTemplate = async (
   to: string,
-  script: string,
+  script: string | undefined,
   variables: Record<string, string> = {},
   from?: string,
-  voiceId?: string
+  voiceId?: string,
+  agentId?: string,
+  contactId?: string,
+  accountId?: string,
+  useAgent?: boolean
 ): Promise<VoiceCallResult> => {
-  const processedScript = replaceTemplateVariables(script, variables);
+  const processedScript = script ? replaceTemplateVariables(script, variables) : undefined;
 
   return makeVoiceCall({
     to,
     script: processedScript,
     from,
     voiceId,
+    agentId,
+    contactId,
+    accountId,
+    useAgent,
   });
 };
 
