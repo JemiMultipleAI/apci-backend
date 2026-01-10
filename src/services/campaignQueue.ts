@@ -115,7 +115,9 @@ export interface CampaignJobData {
 
 // Process campaign message jobs
 // Use 'campaign-message' to match the job name when adding jobs
-campaignQueue.process('campaign-message', async (job) => {
+// Bull v4: process(name, concurrency, processor) - concurrency defaults to 1 if not specified
+logger.info('[CAMPAIGN_QUEUE] Queue processor registered for "campaign-message" jobs');
+campaignQueue.process('campaign-message', 1, async (job) => {
   const { campaignId, contactId, channel, templateId, surveyId, variables, userId, accountId } = job.data as CampaignJobData;
 
   try {
@@ -124,6 +126,7 @@ campaignQueue.process('campaign-message', async (job) => {
       campaignId,
       contactId,
       channel,
+      timestamp: new Date().toISOString(),
     });
 
     // Get contact
@@ -223,9 +226,19 @@ campaignQueue.process('campaign-message', async (job) => {
           throw new Error('Contact has no mobile number');
         }
 
-        // Try to get agent config for the account
+        // Check if OpenAI is configured for agent mode
+        const useAgentForOpenAI = env.AI_AGENT_PROVIDER === 'openai' && !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
+
+        // Try to get agent config for the account (for ElevenLabs compatibility)
         let agentId: string | undefined;
-        if (accountId) {
+        if (useAgentForOpenAI) {
+          // For OpenAI, use a placeholder agent ID
+          agentId = `openai-survey-${survey.id.substring(0, 8)}`;
+          logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode for survey call', {
+            accountId: accountId || 'no-account',
+            surveyId: survey.id,
+          });
+        } else if (accountId) {
           try {
             const agentConfig = await queryOne<{ agent_id: string }>(
               `SELECT agent_id FROM ai_agent_configurations 
@@ -246,8 +259,8 @@ campaignQueue.process('campaign-message', async (job) => {
 
         const surveyCallScript = `Hi ${contact.first_name}, we'd love to hear your feedback! Please visit ${surveyLink} to complete our survey. Thank you!`;
         
-        // Use agent if available, otherwise use simple TTS
-        const useAgent = !!agentId;
+        // Use agent if OpenAI is configured OR if we found an agent config from database
+        const useAgent = useAgentForOpenAI || !!agentId;
         
         result = await makeVoiceCallFromTemplate(
           contact.mobile,
@@ -320,10 +333,32 @@ campaignQueue.process('campaign-message', async (job) => {
           throw new Error('Contact has no mobile number');
         }
 
-        // Try to get agent config for the account
+        logger.info('[CAMPAIGN_QUEUE] Processing call campaign', {
+          campaignId: campaign.id,
+          contactId: contact.id,
+          accountId,
+          mobile: contact.mobile,
+        });
+
+        // Check if OpenAI is configured for agent mode
+        const useAgentForOpenAI = env.AI_AGENT_PROVIDER === 'openai' && !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
+
+        // Try to get agent config for the account (for ElevenLabs compatibility)
         let agentId: string | undefined;
-        if (accountId) {
+        if (useAgentForOpenAI) {
+          // For OpenAI, we don't need a database agent ID - use a placeholder
+          // The actual agent logic is handled by agentService which uses OpenAI Chat API
+          agentId = `openai-${campaign.id.substring(0, 8)}`; // Placeholder agent ID
+          logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode (no database agent config needed)', {
+            accountId: accountId || 'no-account',
+            agentId: agentId.substring(0, 15) + '...',
+            aiProvider: env.AI_AGENT_PROVIDER,
+            openAIModel: env.OPENAI_MODEL,
+          });
+        } else if (accountId) {
+          // Fallback: Try to get agent config from database (for ElevenLabs compatibility)
           try {
+            logger.debug('[CAMPAIGN_QUEUE] Looking up agent config from database', { accountId });
             const agentConfig = await queryOne<{ agent_id: string }>(
               `SELECT agent_id FROM ai_agent_configurations 
                WHERE account_id = $1 AND is_active = true 
@@ -332,40 +367,88 @@ campaignQueue.process('campaign-message', async (job) => {
             );
             if (agentConfig) {
               agentId = agentConfig.agent_id;
+              logger.info('[CAMPAIGN_QUEUE] Agent config found in database', {
+                accountId,
+                agentId: agentId.substring(0, 8) + '...',
+              });
+            } else {
+              logger.info('[CAMPAIGN_QUEUE] No agent config found in database, will use simple TTS', {
+                accountId,
+              });
             }
           } catch (error: any) {
-            logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config, using simple TTS call', {
+            logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config from database, using simple TTS call', {
               accountId,
               error: error.message,
             });
           }
+        } else if (!useAgentForOpenAI) {
+          logger.warn('[CAMPAIGN_QUEUE] No accountId and OpenAI not configured, cannot use agent', {
+            campaignId: campaign.id,
+            aiProvider: env.AI_AGENT_PROVIDER || 'not-set',
+            hasOpenAIKey: !!env.OPENAI_API_KEY,
+          });
         }
 
-        // Use agent if available, otherwise use simple TTS
-        const useAgent = !!agentId;
-        // For agent calls, play template first as introduction, then agent takes over
+        // Use agent if OpenAI is configured OR if we found an agent config from database
+        const useAgent = useAgentForOpenAI || !!agentId;
+        logger.info('[CAMPAIGN_QUEUE] Call configuration', {
+          useAgent,
+          agentId: agentId ? agentId.substring(0, 8) + '...' : 'none',
+          hasScript: !!template.body,
+        });
+
+        // IMPORTANT: For agent calls, do NOT pass the template script
+        // Agent mode goes straight to AI conversation without template playback
         // For non-agent calls, use template as the full script
-        const callScript = replaceTemplateVariables(template.body, variables);
+        const callScript = useAgent ? undefined : replaceTemplateVariables(template.body, variables);
 
-        result = await makeVoiceCallFromTemplate(
-          contact.mobile,
-          callScript, // Always pass script - plays first for agent calls, full script for non-agent calls
-          variables,
-          undefined, // from
-          undefined, // voiceId
-          agentId,
-          contactId,
-          accountId,
-          useAgent
-        );
+        try {
+          logger.info('[CAMPAIGN_QUEUE] Making voice call', {
+            to: contact.mobile,
+            useAgent,
+            agentId: agentId ? agentId.substring(0, 8) + '...' : undefined,
+            hasScript: !!callScript,
+            note: useAgent 
+              ? '✅ Agent mode - NO template script, goes straight to AI agent conversation'
+              : 'Non-agent mode - will play template script',
+          });
 
-        if (result.success) {
-          activityType = 'call';
-          activityDescription = useAgent 
-            ? `Made AI agent call: ${template.name}` 
-            : `Made call: ${template.name}`;
-        } else {
-          throw new Error(result.error || 'Failed to make voice call');
+          result = await makeVoiceCallFromTemplate(
+            contact.mobile,
+            callScript, // Pass undefined for agent calls (no template), script for non-agent calls
+            variables,
+            undefined, // from
+            undefined, // voiceId
+            agentId,
+            contactId,
+            accountId,
+            useAgent
+          );
+
+          logger.info('[CAMPAIGN_QUEUE] Voice call result', {
+            success: result.success,
+            callId: result.callId,
+            error: result.error,
+            useAgent,
+          });
+
+          if (result.success) {
+            activityType = 'call';
+            activityDescription = useAgent 
+              ? `Made AI agent call: ${template.name}` 
+              : `Made call: ${template.name}`;
+          } else {
+            throw new Error(result.error || 'Failed to make voice call');
+          }
+        } catch (error: any) {
+          logger.error('[CAMPAIGN_QUEUE] Voice call failed', {
+            error: error.message,
+            stack: error.stack,
+            useAgent,
+            agentId: agentId ? agentId.substring(0, 8) + '...' : undefined,
+          });
+          throw error;
         }
       }
     } else {
@@ -510,9 +593,63 @@ campaignQueue.on('error', (error) => {
   });
 });
 
-campaignQueue.on('waiting', (jobId) => {
-  logger.debug('[CAMPAIGN_QUEUE] Job waiting', { jobId });
+campaignQueue.on('ready', () => {
+  logger.info('[CAMPAIGN_QUEUE] Queue is ready to process jobs');
 });
+
+campaignQueue.on('waiting', (jobId) => {
+  logger.info('[CAMPAIGN_QUEUE] Job waiting', { jobId });
+});
+
+campaignQueue.on('delayed', (job) => {
+  logger.info('[CAMPAIGN_QUEUE] Job delayed', { 
+    jobId: job.id,
+    delay: job.opts.delay,
+    willProcessAt: new Date(Date.now() + (job.opts.delay || 0)).toISOString(),
+  });
+});
+
+campaignQueue.on('active', (job) => {
+  logger.info('[CAMPAIGN_QUEUE] Job became active', { 
+    jobId: job.id,
+    campaignId: job.data?.campaignId,
+    channel: job.data?.channel,
+  });
+});
+
+campaignQueue.on('stalled', (job) => {
+  logger.warn('[CAMPAIGN_QUEUE] Job stalled', { jobId: job?.id });
+});
+
+campaignQueue.on('progress', (job, progress) => {
+  logger.debug('[CAMPAIGN_QUEUE] Job progress', { jobId: job.id, progress });
+});
+
+// Check queue status periodically to diagnose issues
+setTimeout(async () => {
+  try {
+    const isReady = await campaignQueue.isReady();
+    const waitingCount = await campaignQueue.getWaitingCount();
+    const activeCount = await campaignQueue.getActiveCount();
+    const delayedCount = await campaignQueue.getDelayedCount();
+    const failedCount = await campaignQueue.getFailedCount();
+    
+    logger.info('[CAMPAIGN_QUEUE] Queue status check', {
+      isReady,
+      waitingCount,
+      activeCount,
+      delayedCount,
+      failedCount,
+      processorRegistered: true,
+      note: 'If waitingCount > 0 but activeCount = 0, processor may not be picking up jobs',
+    });
+  } catch (error: any) {
+    logger.error('[CAMPAIGN_QUEUE] Error checking queue status', {
+      error: error.message,
+      stack: error.stack,
+    });
+  }
+}, 5000); // Check 5 seconds after startup
 
 // Helper function to get connection info for logging
 function getRedisConnectionInfo(): Record<string, any> {

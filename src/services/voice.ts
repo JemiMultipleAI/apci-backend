@@ -1,4 +1,5 @@
 import { env } from '../config/env';
+import { logger } from '../utils/logger';
 import twilio from 'twilio';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { ElevenLabsClient } = require('elevenlabs');
@@ -73,6 +74,15 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
   const voiceId = options.voiceId || env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
   const useAgent = options.useAgent || false;
 
+  logger.info('[VOICE] makeVoiceCall called', {
+    provider,
+    to: options.to,
+    useAgent,
+    hasAgentId: !!options.agentId,
+    hasScript: !!options.script,
+    publicWebhookUrl: env.PUBLIC_WEBHOOK_URL ? 'SET' : 'NOT SET',
+  });
+
   try {
     if (provider === 'twilio') {
       if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) {
@@ -86,17 +96,80 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
       const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
 
       // If using agent (Media Streams for real-time conversation)
-      if (useAgent && options.agentId) {
+      // Simplified: Trust the useAgent flag from campaignQueue - it already checked OpenAI configuration
+      // No need to re-check here - if campaignQueue set useAgent=true, use agent mode
+      const shouldUseAgent = useAgent === true;
+
+      if (shouldUseAgent) {
+        // SAFEGUARD: Ignore any script/template for agent calls - go straight to agent
+        // Agent mode uses Media Streams for real-time conversation, no template playback
+        if (options.script) {
+          logger.warn('[VOICE] Script provided for agent call - ignoring script, going straight to agent', {
+            scriptPreview: options.script.substring(0, 50) + (options.script.length > 50 ? '...' : ''),
+            scriptLength: options.script.length,
+            note: 'Agent mode does not use template scripts - the AI agent handles the conversation directly via Media Streams',
+          });
+        }
+        
+        // Use placeholder agentId if not provided (OpenAI doesn't need a real agentId from database)
+        const effectiveAgentId = options.agentId || 'openai-default';
+        
+        logger.info('[VOICE] Using agent mode with Media Streams', {
+          agentId: effectiveAgentId.substring(0, 15) + '...',
+          contactId: options.contactId,
+          accountId: options.accountId,
+          sttProvider: env.STT_PROVIDER || 'openai',
+          aiProvider: env.AI_AGENT_PROVIDER || 'elevenlabs',
+          useAgentFromOptions: useAgent,
+          note: 'Agent mode enabled - campaignQueue already validated OpenAI configuration',
+        });
+
         if (!env.PUBLIC_WEBHOOK_URL) {
-          throw new Error('PUBLIC_WEBHOOK_URL is required for agent calls (Media Streams)');
+          const error = 'PUBLIC_WEBHOOK_URL is required for agent calls (Media Streams)';
+          logger.error('[VOICE] ' + error);
+          throw new Error(error);
         }
 
         // Build Media Streams URL
-        const mediaStreamUrl = `${env.PUBLIC_WEBHOOK_URL}/api/webhooks/twilio/media-streams`;
+        // Twilio Media Streams requires wss:// (WebSocket Secure) protocol in TwiML
+        // Normalize URL: handle http://, https://, and ensure proper format
+        let baseUrl = (env.PUBLIC_WEBHOOK_URL || '').trim();
+        
+        // Remove trailing slashes
+        baseUrl = baseUrl.replace(/\/+$/, '');
+        
+        // Convert to wss:// protocol (handle http://, https://, or already wss://)
+        if (baseUrl.startsWith('http://')) {
+          baseUrl = baseUrl.replace(/^http:\/\//, 'wss://');
+        } else if (baseUrl.startsWith('https://')) {
+          baseUrl = baseUrl.replace(/^https:\/\//, 'wss://');
+        } else if (!baseUrl.startsWith('wss://')) {
+          // If no protocol specified, assume https and convert to wss
+          baseUrl = `wss://${baseUrl}`;
+        }
+        
+        // Construct full URL, ensuring no double slashes in path
+        const path = '/api/webhooks/twilio/media-streams';
+        const mediaStreamUrl = `${baseUrl}${path}`;
+        
+        // Validate URL format
+        try {
+          const url = new URL(mediaStreamUrl);
+          if (url.protocol !== 'wss:') {
+            throw new Error(`Media Streams URL must use wss:// protocol, got: ${url.protocol}`);
+          }
+        } catch (error: any) {
+          logger.error('[VOICE] Invalid Media Streams URL format', {
+            originalUrl: env.PUBLIC_WEBHOOK_URL,
+            constructedUrl: mediaStreamUrl,
+            error: error.message,
+          });
+          throw new Error(`Invalid Media Streams URL format: ${error.message}`);
+        }
         
         // Build custom parameters to pass to Media Streams
         const customParams: Record<string, string> = {
-          agent_id: options.agentId,
+          agent_id: effectiveAgentId, // Use placeholder or actual agentId (defined above)
         };
         if (options.contactId) {
           customParams.contact_id = options.contactId;
@@ -106,35 +179,87 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
         }
 
         // Create TwiML with Media Streams
-        // Note: Twilio Media Streams passes custom parameters via query string in the WebSocket URL
-        const params = new URLSearchParams(customParams);
-        const mediaStreamUrlWithParams = `${mediaStreamUrl}?${params.toString()}`;
+        // Note: Twilio Media Streams passes custom parameters via the 'parameter' attributes in TwiML
+        // These will be included in the 'start' event message's customParameters field
+        logger.info('[VOICE] Creating TwiML with Media Streams', {
+          mediaStreamUrl: mediaStreamUrl,
+          baseUrl: baseUrl,
+          originalPublicWebhookUrl: env.PUBLIC_WEBHOOK_URL,
+          customParameters: customParams,
+          hasScript: !!options.script,
+        });
         
+        // REVERTED: Back to <Connect><Stream> - <Start><Stream> broke initial conversation
+        // Based on Twilio Media Streams documentation: https://www.twilio.com/docs/voice/media-streams
+        // Based on Twilio Media Streams documentation: https://www.twilio.com/docs/voice/twiml/stream#track
+        // For <Connect><Stream> (bidirectional streams), we can only receive the inbound_track
+        // CRITICAL: Explicitly specify track="inbound_track" to ensure we receive caller audio
+        // Without this, Twilio might not send inbound audio properly (causing 2-3 byte chunks)
         const twiml = new twilio.twiml.VoiceResponse();
-        const start = twiml.start();
-        start.stream({
-          url: mediaStreamUrlWithParams,
+        const stream = twiml.connect().stream({
+          url: mediaStreamUrl,
+          track: 'inbound_track', // Explicitly request inbound track for caller audio
+        });
+        
+        // Add custom parameters as parameter attributes
+        // Twilio will include these in the start event's customParameters field
+        Object.entries(customParams).forEach(([key, value]) => {
+          stream.parameter({
+            name: key,
+            value: value,
+          });
         });
 
-        // Play template message first (if provided), then agent takes over
-        if (options.script) {
-          twiml.say({
-            voice: 'alice',
-            language: 'en-US',
-          }, options.script);
-        }
+        // Note: <Connect> blocks execution, so <Say> and <Pause> won't execute
+        // The stream starts immediately and goes directly to the AI agent
+        // The call stays open as long as the Media Stream WebSocket is connected
 
-        // CRITICAL: Add a long pause to keep the call alive while Media Stream is active
-        // The call will stay open as long as the Media Stream WebSocket is connected
-        // This allows the template to play first, then the agent takes over for conversation
-        twiml.pause({
-          length: 3600, // 1 hour (max) - call will end when stream disconnects anyway
+        const twimlString = twiml.toString();
+        
+        // Verify TwiML was generated correctly with track attribute
+        const hasTrackAttribute = twimlString.includes('track=');
+        const trackValueMatch = twimlString.match(/track="?([^"\s>]+)"?/);
+        const trackValue = trackValueMatch ? trackValueMatch[1] : 'NOT FOUND';
+        
+        logger.info('[VOICE] Generated TwiML for Media Stream (using <Connect><Stream>)', {
+          twiml: twimlString,
+          hasTrackAttribute,
+          trackValue,
+          hasInboundTrack: trackValue === 'inbound_track',
+          note: hasTrackAttribute && trackValue === 'inbound_track'
+            ? '✅ TwiML correctly includes track="inbound_track" - should receive caller audio'
+            : '⚠️ TwiML missing or incorrect track attribute - caller audio may not be received properly',
+        });
+        
+        logger.debug('[VOICE] Generated TwiML', {
+          twiml: twimlString,
+        });
+
+        logger.info('[VOICE] Creating Twilio call with recording enabled', {
+          to: options.to,
+          from: fromNumber,
+          record: true,
+          recordingChannels: 'dual',
+          note: 'Recording enabled for diagnostics - check Twilio Console → Monitor → Recordings after call to verify if inbound audio was captured',
         });
 
         const call = await client.calls.create({
-          twiml: twiml.toString(),
+          twiml: twimlString,
           to: options.to,
           from: fromNumber,
+          record: true, // Enable recording for diagnostics - check if Twilio captures inbound audio
+          recordingChannels: 'dual', // 'dual' records both inbound (caller) and outbound (AI) separately
+          // Note: 'dual' recording allows us to hear if inbound audio is actually being captured
+          // After the call, check Twilio Console → Monitor → Recordings to listen to the recording
+          // If inbound channel has audio, Twilio is capturing it but Media Stream isn't receiving it
+          // If inbound channel is silent, Twilio isn't receiving audio from caller device
+        });
+
+        logger.info('[VOICE] Twilio call created successfully', {
+          callSid: call.sid,
+          status: call.status,
+          to: call.to,
+          from: call.from,
         });
 
         return {
@@ -144,6 +269,10 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
       }
 
       // Fallback: Simple TTS call (non-agent)
+      logger.info('[VOICE] Using simple TTS mode (non-agent)', {
+        hasScript: !!options.script,
+      });
+      
       if (!options.script) {
         throw new Error('Script is required for non-agent calls');
       }

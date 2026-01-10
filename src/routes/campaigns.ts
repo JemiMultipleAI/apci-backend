@@ -679,6 +679,13 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     const { id } = req.params;
     const { contact_ids, template_id } = req.body;
 
+    logger.info('[CAMPAIGN] Execute endpoint called', {
+      campaignId: id,
+      userId: req.user.userId,
+      hasContactIds: !!contact_ids,
+      hasTemplateId: !!template_id,
+    });
+
     // Validate UUID format
     const uuidSchema = z.string().uuid();
     if (!uuidSchema.safeParse(id).success) {
@@ -700,6 +707,13 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     if (!campaign) {
       throw createError('Campaign not found', 404);
     }
+
+    logger.info('[CAMPAIGN] Campaign found for execution', {
+      campaignId: campaign.id,
+      campaignName: campaign.name,
+      channel: campaign.channel,
+      status: campaign.status,
+    });
 
     // Check company access for non-super_admin users
     if (!isSuperAdmin(req.user!) && campaign.created_by) {
@@ -841,6 +855,11 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     if (contacts.length === 0) {
       throw createError('No contacts found for campaign execution', 400);
     }
+
+    logger.info('[CAMPAIGN] Contacts found for execution', {
+      campaignId: campaign.id,
+      contactCount: contacts.length,
+    });
 
     // Validate campaign can be executed
     if (campaign.status === 'completed') {
@@ -984,6 +1003,7 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
               contactId: contact.id,
               channel,
               error: error.message,
+              stack: error.stack,
             });
             return null; // Don't throw, just track the error
           });
@@ -998,6 +1018,14 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
 
     // Wait for all jobs to be queued in parallel (this should be fast - just adding to Redis)
     await Promise.allSettled(jobPromises);
+
+    logger.info('[CAMPAIGN] Campaign execution completed - jobs queued', {
+      campaignId: campaign.id,
+      totalContacts: results.total,
+      queuedJobs: results.queued,
+      failedJobs: results.failed,
+      totalJobs: results.jobs.length,
+    });
 
     // Store job IDs in campaign metadata for tracking
     const updatedMetadata = {

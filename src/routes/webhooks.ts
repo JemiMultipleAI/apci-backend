@@ -1015,26 +1015,97 @@ router.post('/inbound/sms', async (req: Request, res: Response, next: NextFuncti
 // Export function to setup WebSocket server for Media Streams
 // This needs to be called from the main server file
 export function setupMediaStreamsWebSocket(server: any): void {
-  const wss = new WebSocket.Server({
-    server,
-    path: '/api/webhooks/twilio/media-streams',
+  try {
+    const wss = new WebSocket.Server({
+      server,
+      path: '/api/webhooks/twilio/media-streams',
+      clientTracking: true, // Track connected clients for debugging
+      perMessageDeflate: false, // Disable compression for better performance with audio
+      verifyClient: (info: any) => {
+      // Extract query parameters from the full URL (available in verifyClient)
+      const fullUrl = info.req.url || '';
+      let queryParams: Record<string, string> = {};
+      
+      try {
+        const url = new URL(fullUrl, `http://${info.req.headers.host || 'localhost'}`);
+        url.searchParams.forEach((value, key) => {
+          queryParams[key] = value;
+        });
+      } catch (error) {
+        // URL parsing failed, try manual parsing
+        const queryString = fullUrl.split('?')[1];
+        if (queryString) {
+          queryString.split('&').forEach((param: string) => {
+            const [key, value] = param.split('=');
+            if (key && value) {
+              queryParams[decodeURIComponent(key)] = decodeURIComponent(value);
+            }
+          });
+        }
+      }
+
+      // Attach query parameters to request object for later use
+      (info.req as any).__customParameters = queryParams;
+
+      // Log all connection attempts (even failed ones) to help debug
+      logger.info('[MEDIA_STREAM] WebSocket connection attempt', {
+        origin: info.origin,
+        secure: info.secure,
+        reqUrl: info.req.url,
+        queryParams: Object.keys(queryParams).length > 0 ? queryParams : 'none',
+        headers: {
+          'user-agent': info.req.headers['user-agent'],
+          'upgrade': info.req.headers.upgrade,
+          'connection': info.req.headers.connection,
+        },
+      });
+      return true; // Accept all connections
+    },
   });
 
   wss.on('connection', (ws: WebSocket, req: any) => {
-    logger.info('[MEDIA_STREAM] New WebSocket connection attempt', {
+    // Retrieve query parameters attached in verifyClient
+    const customParameters = (req as any).__customParameters || {};
+    
+    logger.info('[MEDIA_STREAM] New WebSocket connection established', {
       url: req.url,
-      headers: req.headers,
+      customParameters: Object.keys(customParameters).length > 0 ? customParameters : 'none',
+      headers: {
+        'user-agent': req.headers['user-agent'],
+        'origin': req.headers.origin,
+      },
     });
+    
+    // Attach to req for use in handleMediaStreamConnection
+    (req as any).customParameters = customParameters;
     handleMediaStreamConnection(ws, req);
   });
 
   wss.on('error', (error: Error) => {
     logger.error('[MEDIA_STREAM] WebSocket server error', {
       error: error.message,
+      stack: error.stack,
     });
   });
 
-  logger.info('[MEDIA_STREAM] WebSocket server started on /api/webhooks/twilio/media-streams');
+  // Log when HTTP server is listening (WebSocket will be ready)
+  server.on('listening', () => {
+    logger.info('[MEDIA_STREAM] WebSocket server ready on /api/webhooks/twilio/media-streams', {
+      address: server.address(),
+      path: '/api/webhooks/twilio/media-streams',
+    });
+  });
+
+  logger.info('[MEDIA_STREAM] WebSocket server initialized and ready');
+  } catch (error: any) {
+    logger.error('[MEDIA_STREAM] Failed to setup WebSocket server', {
+      error: error.message,
+      stack: error.stack,
+    });
+    // Don't throw - allow server to start even if WebSocket setup fails
+    // This prevents the entire server from crashing
+    console.error('⚠️  WebSocket server setup failed, but continuing server startup');
+  }
 }
 
 export default router;

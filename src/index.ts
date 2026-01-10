@@ -167,14 +167,59 @@ const startServer = async () => {
       console.warn('⚠️  MongoDB connection failed (optional):', error.message);
     });
     
+    // Create HTTP server but don't start listening yet
     const server = app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`📡 API: ${env.API_BASE_URL}`);
       console.log(`🌍 Environment: ${env.NODE_ENV}`);
       
-      // Setup WebSocket server for Twilio Media Streams
-      setupMediaStreamsWebSocket(server);
+      // Log AI Provider configuration
+      const aiProvider = env.AI_AGENT_PROVIDER || 'elevenlabs';
+      const openAIKey = (env.OPENAI_API_KEY || '').trim();
+      const hasOpenAIKey = openAIKey.length > 0;
+      const isProjectKey = openAIKey.startsWith('sk-proj-');
+      const isOpenRouter = openAIKey.startsWith('sk-or-');
+      const keyType = isProjectKey ? 'Project Key' : isOpenRouter ? 'OpenRouter' : 'Standard';
+      const fallbackDisabled = env.DISABLE_ELEVENLABS_FALLBACK === true;
+      
+      console.log(`\n🤖 AI Agent Provider Configuration:`);
+      console.log(`   Provider: ${aiProvider.toUpperCase()}`);
+      if (aiProvider === 'openai') {
+        if (hasOpenAIKey) {
+          console.log(`   ✅ OpenAI API Key: ${keyType} - ${openAIKey.substring(0, 15)}...`);
+          console.log(`   Model: ${env.OPENAI_MODEL}`);
+          console.log(`   Base URL: ${env.OPENAI_BASE_URL || 'https://api.openai.com/v1 (default)'}`);
+          console.log(`   Status: Ready to use OpenAI`);
+          if (fallbackDisabled) {
+            console.log(`   ⚠️  Fallback: DISABLED - OpenAI errors will NOT fallback to ElevenLabs`);
+          } else {
+            console.log(`   🔄 Fallback: ENABLED - Will fallback to ElevenLabs if OpenAI fails`);
+          }
+        } else {
+          console.log(`   ⚠️  OpenAI API Key: NOT SET`);
+          if (fallbackDisabled) {
+            console.log(`   ❌ Fallback: DISABLED - System will fail if OpenAI is not configured`);
+          } else {
+            console.log(`   Will fallback to ElevenLabs`);
+          }
+        }
+      } else {
+        console.log(`   ✅ Using ElevenLabs (default provider)`);
+        if (hasOpenAIKey) {
+          console.log(`   ℹ️  Note: OpenAI API key is set but AI_AGENT_PROVIDER is not 'openai'`);
+        }
+      }
+      console.log(``);
     });
+    
+    // Setup WebSocket server BEFORE server starts accepting connections
+    // This ensures it's ready when Twilio tries to connect
+    setupMediaStreamsWebSocket(server);
+    
+    // Small delay to ensure WebSocket server is fully initialized
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    console.log('✅ WebSocket server ready for Media Streams');
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);

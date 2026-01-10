@@ -2,8 +2,76 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate } from '../middleware/auth';
 import { analyzeSentiment, predictChurn, getNextBestAction } from '../services/ai';
 import { createError } from '../middleware/errorHandler';
+import { env } from '../config/env';
 
 const router = Router();
+
+// GET /api/ai/status - Check AI provider configuration and status
+router.get('/status', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const provider = env.AI_AGENT_PROVIDER || 'elevenlabs';
+    const hasOpenAIKey = !!env.OPENAI_API_KEY;
+    const openAIKeyPrefix = env.OPENAI_API_KEY ? env.OPENAI_API_KEY.substring(0, 7) + '...' : 'not set';
+    const openAIKeyLength = env.OPENAI_API_KEY?.length || 0;
+    
+    // Determine which provider will be used
+    let activeProvider: 'openai' | 'elevenlabs';
+    let reason: string;
+    
+    if (provider === 'openai' && hasOpenAIKey) {
+      activeProvider = 'openai';
+      reason = 'OpenAI is configured and API key is present';
+    } else if (provider === 'openai' && !hasOpenAIKey) {
+      activeProvider = 'elevenlabs';
+      reason = 'AI_AGENT_PROVIDER is set to openai but OPENAI_API_KEY is missing';
+    } else {
+      activeProvider = 'elevenlabs';
+      reason = provider === 'elevenlabs' ? 'Default provider (ElevenLabs)' : 'AI_AGENT_PROVIDER not set, using default';
+    }
+    
+    const fallbackDisabled = env.DISABLE_ELEVENLABS_FALLBACK === true;
+    const isProjectKey = env.OPENAI_API_KEY?.startsWith('sk-proj-');
+    const isOpenRouter = env.OPENAI_API_KEY?.startsWith('sk-or-');
+    const isCustomBaseURL = !!env.OPENAI_BASE_URL;
+
+    res.json({
+      success: true,
+      data: {
+        configuredProvider: provider,
+        activeProvider,
+        reason,
+        fallback: {
+          disabled: fallbackDisabled,
+          willFallback: !fallbackDisabled && (provider !== 'openai' || !hasOpenAIKey),
+          note: fallbackDisabled 
+            ? 'Fallback to ElevenLabs is DISABLED. OpenAI errors will not fallback.' 
+            : 'Fallback to ElevenLabs is ENABLED. Will fallback if OpenAI fails.',
+        },
+        openai: {
+          configured: provider === 'openai',
+          apiKeyPresent: hasOpenAIKey,
+          apiKeyPrefix: openAIKeyPrefix,
+          apiKeyLength: openAIKeyLength,
+          keyType: isProjectKey ? 'project_key (sk-proj-*)' : isOpenRouter ? 'openrouter (sk-or-*)' : hasOpenAIKey ? 'standard (sk-*)' : 'not_set',
+          model: env.OPENAI_MODEL || 'gpt-4o-mini',
+          baseURL: env.OPENAI_BASE_URL || (isOpenRouter ? 'https://openrouter.ai/api/v1 (auto-detected)' : 'https://api.openai.com/v1 (default)'),
+          isCustomBaseURL: isCustomBaseURL,
+          isUsingOpenRouter: isOpenRouter,
+          status: hasOpenAIKey ? 'ready' : 'missing_api_key',
+        },
+        elevenlabs: {
+          configured: provider === 'elevenlabs' || activeProvider === 'elevenlabs',
+          apiKeyPresent: !!env.ELEVENLABS_API_KEY,
+          voiceId: env.ELEVENLABS_VOICE_ID || 'default',
+          status: env.ELEVENLABS_API_KEY ? 'ready' : 'missing_api_key',
+          fallbackAvailable: !fallbackDisabled,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 
 // POST /api/ai/sentiment - Analyze sentiment from text
 router.post('/sentiment', authenticate, async (req: Request, res: Response, next: NextFunction) => {

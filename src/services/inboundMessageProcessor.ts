@@ -1,7 +1,7 @@
 import { queryOne } from '../db/connection';
 import { sendEmailFromTemplate } from './email';
 import { sendSMSFromTemplate } from './sms';
-import { sendMessageToAgent } from './elevenlabsAgent';
+import { sendMessageToAgent } from './agentService'; // Updated to use unified agent service
 import { isRateLimited, recordRequest } from './rateLimiter';
 import { logAgentEvent } from './agentLogger';
 import { logger } from '../utils/logger';
@@ -151,11 +151,12 @@ export async function processInboundMessage(
     // Record request for rate limiting
     recordRequest(agentConfig.agent_id);
 
-    // 4. Send message to ElevenLabs agent
-    logger.info('[INBOUND] Sending message to ElevenLabs agent', {
+    // 4. Send message to AI agent (OpenAI or ElevenLabs based on config)
+    logger.info('[INBOUND] Sending message to AI agent', {
       agentId: agentConfig.agent_id.substring(0, 8) + '...',
       messageLength: options.messageBody.length,
       contactId: contactId,
+      provider: process.env.AI_AGENT_PROVIDER || 'elevenlabs',
     });
 
     const agentRequestStartTime = Date.now();
@@ -400,11 +401,12 @@ export async function processInboundMessageByContact(
     // Record request for rate limiting
     recordRequest(agentConfig.agent_id);
 
-    // Send message to ElevenLabs agent
-    logger.info('[INBOUND] Sending message to ElevenLabs agent', {
+    // Send message to AI agent (OpenAI or ElevenLabs based on config)
+    logger.info('[INBOUND] Sending message to AI agent', {
       agentId: agentConfig.agent_id.substring(0, 8) + '...',
       messageLength: options.messageBody.length,
       contactId: options.contactId,
+      provider: process.env.AI_AGENT_PROVIDER || 'elevenlabs',
     });
 
     const agentRequestStartTime = Date.now();
