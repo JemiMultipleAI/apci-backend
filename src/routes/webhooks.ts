@@ -468,9 +468,11 @@ router.post('/inbound/email/:token', async (req: Request, res: Response, next: N
 
     // Return success immediately (processing is async)
     res.status(200).json({ success: true, message: 'Email reply received and processing' });
+    return;
   } catch (error: any) {
     logger.error('Failed to process inbound email', { error: error.message });
     next(error);
+    return;
   }
 });
 
@@ -721,10 +723,12 @@ router.post('/inbound/email', async (req: Request, res: Response, next: NextFunc
 
     // Return success immediately (processing is async)
     res.status(200).json({ success: true, message: 'Email reply received and processing' });
+    return;
   } catch (error: any) {
     logger.error('[WEBHOOK] Failed to process inbound email', { error: error.message, stack: error.stack });
     // Still return 200 to email provider to prevent retries
     res.status(200).json({ success: false, error: 'Internal error processing email' });
+    return;
   }
 });
 
@@ -825,9 +829,11 @@ router.post('/inbound/sms/:token', async (req: Request, res: Response, next: Nex
 
     // Return success immediately (processing is async)
     res.status(200).json({ success: true, message: 'SMS reply received and processing' });
+    return;
   } catch (error: any) {
     logger.error('[WEBHOOK] Failed to process inbound SMS (token-based)', { error: error.message, stack: error.stack });
     next(error);
+    return;
   }
 });
 
@@ -1005,10 +1011,12 @@ router.post('/inbound/sms', async (req: Request, res: Response, next: NextFuncti
 
     // Return success immediately (processing is async)
     res.status(200).json({ success: true, message: 'SMS reply received and processing' });
+    return;
   } catch (error: any) {
     logger.error('[WEBHOOK] Failed to process inbound SMS', { error: error.message, stack: error.stack });
     // Still return 200 to Twilio to prevent retries
     res.status(200).json({ success: false, error: 'Internal error processing SMS' });
+    return;
   }
 });
 
@@ -1016,56 +1024,52 @@ router.post('/inbound/sms', async (req: Request, res: Response, next: NextFuncti
 // This needs to be called from the main server file
 export function setupMediaStreamsWebSocket(server: any): void {
   try {
+    // Simplified WebSocket server setup - matching Python/Flask pattern
+    // No verifyClient, no clientTracking - just accept connections directly
+    // This prevents "Reserved bits are non-zero" protocol violations
     const wss = new WebSocket.Server({
       server,
       path: '/api/webhooks/twilio/media-streams',
-      clientTracking: true, // Track connected clients for debugging
-      perMessageDeflate: false, // Disable compression for better performance with audio
-      verifyClient: (info: any) => {
-      // Extract query parameters from the full URL (available in verifyClient)
-      const fullUrl = info.req.url || '';
-      let queryParams: Record<string, string> = {};
-      
-      try {
-        const url = new URL(fullUrl, `http://${info.req.headers.host || 'localhost'}`);
-        url.searchParams.forEach((value, key) => {
-          queryParams[key] = value;
-        });
-      } catch (error) {
-        // URL parsing failed, try manual parsing
-        const queryString = fullUrl.split('?')[1];
-        if (queryString) {
-          queryString.split('&').forEach((param: string) => {
-            const [key, value] = param.split('=');
-            if (key && value) {
-              queryParams[decodeURIComponent(key)] = decodeURIComponent(value);
-            }
-          });
-        }
-      }
-
-      // Attach query parameters to request object for later use
-      (info.req as any).__customParameters = queryParams;
-
-      // Log all connection attempts (even failed ones) to help debug
-      logger.info('[MEDIA_STREAM] WebSocket connection attempt', {
-        origin: info.origin,
-        secure: info.secure,
-        reqUrl: info.req.url,
-        queryParams: Object.keys(queryParams).length > 0 ? queryParams : 'none',
-        headers: {
-          'user-agent': info.req.headers['user-agent'],
-          'upgrade': info.req.headers.upgrade,
-          'connection': info.req.headers.connection,
-        },
-      });
-      return true; // Accept all connections
-    },
-  });
+      // Removed clientTracking - can cause protocol issues
+      // Removed perMessageDeflate - using defaults
+      // Removed verifyClient - accept all connections directly (like Python example)
+    });
 
   wss.on('connection', (ws: WebSocket, req: any) => {
-    // Retrieve query parameters attached in verifyClient
-    const customParameters = (req as any).__customParameters || {};
+    // NOW extract query parameters (after handshake is complete)
+    // This prevents WebSocket protocol violations during handshake
+    const fullUrl = req.url || '';
+    let customParameters: Record<string, string> = {};
+    
+    try {
+      const url = new URL(fullUrl, `http://${req.headers.host || 'localhost'}`);
+      url.searchParams.forEach((value, key) => {
+        customParameters[key] = value;
+      });
+    } catch (error) {
+      // URL parsing failed, try manual parsing
+      const queryString = fullUrl.split('?')[1];
+      if (queryString) {
+        queryString.split('&').forEach((param: string) => {
+          const [key, value] = param.split('=');
+          if (key && value) {
+            customParameters[decodeURIComponent(key)] = decodeURIComponent(value);
+          }
+        });
+      }
+    }
+    
+    // NOW do the logging (after connection is established and handshake is complete)
+    logger.info('[MEDIA_STREAM] WebSocket connection attempt', {
+      url: req.url,
+      customParameters: Object.keys(customParameters).length > 0 ? customParameters : 'none',
+      headers: {
+        'user-agent': req.headers['user-agent'],
+        'origin': req.headers.origin,
+        'upgrade': req.headers.upgrade,
+        'connection': req.headers.connection,
+      },
+    });
     
     logger.info('[MEDIA_STREAM] New WebSocket connection established', {
       url: req.url,

@@ -53,9 +53,11 @@ router.get('/:token/company/:companyId/campaigns', async (req: Request, res: Res
     // Return as plain text (ElevenLabs knowledge base format)
     res.setHeader('Content-Type', 'text/plain');
     res.send(knowledgeBaseText);
+    return;
   } catch (error) {
     logger.error('[KNOWLEDGE_BASE] Error fetching campaigns', { error });
     next(error);
+    return;
   }
 });
 
@@ -79,9 +81,11 @@ router.get('/:token/company/:companyId/deals', async (req: Request, res: Respons
 
     res.setHeader('Content-Type', 'text/plain');
     res.send(knowledgeBaseText);
+    return;
   } catch (error) {
     logger.error('[KNOWLEDGE_BASE] Error fetching deals', { error });
     next(error);
+    return;
   }
 });
 

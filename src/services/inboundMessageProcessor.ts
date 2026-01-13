@@ -151,12 +151,12 @@ export async function processInboundMessage(
     // Record request for rate limiting
     recordRequest(agentConfig.agent_id);
 
-    // 4. Send message to AI agent (OpenAI or ElevenLabs based on config)
+    // 4. Send message to AI agent (OpenAI only now)
     logger.info('[INBOUND] Sending message to AI agent', {
       agentId: agentConfig.agent_id.substring(0, 8) + '...',
       messageLength: options.messageBody.length,
       contactId: contactId,
-      provider: process.env.AI_AGENT_PROVIDER || 'elevenlabs',
+      provider: 'openai',
     });
 
     const agentRequestStartTime = Date.now();

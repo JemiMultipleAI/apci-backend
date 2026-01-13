@@ -1,4 +1,15 @@
 import { Request, Response, NextFunction } from 'express';
+import { logger } from '../utils/logger';
+import { getRequestId } from '../utils/requestId';
+
+// Extend Express Request to include request ID
+declare global {
+  namespace Express {
+    interface Request {
+      requestId?: string;
+    }
+  }
+}
 
 export const requestLogger = (
   req: Request,
@@ -6,52 +17,61 @@ export const requestLogger = (
   next: NextFunction
 ) => {
   const startTime = Date.now();
-  const timestamp = new Date().toISOString();
+  const requestId = getRequestId(req);
+  req.requestId = requestId;
+
+  // Add request ID to response headers
+  res.setHeader('X-Request-ID', requestId);
   
-  // Skip logging for health check to reduce noise
+  // Skip detailed logging for health check to reduce noise
   if (req.path === '/health') {
     return next();
   }
   
-  // Log request details
-  console.log(`\n🔵 [API] ${timestamp} - ${req.method} ${req.path}`);
-  console.log(`🔵 [API] Query params:`, req.query);
+  // Log request details with structured logging
+  const requestLog: any = {
+    requestId,
+    method: req.method,
+    path: req.path,
+    query: req.query,
+    ip: req.ip || req.socket.remoteAddress,
+    userAgent: req.get('user-agent')?.substring(0, 100),
+  };
+
   if (req.method !== 'GET' && req.body) {
     // Mask sensitive data in body
     const bodyCopy = { ...req.body };
     if (bodyCopy.password) bodyCopy.password = '***';
-    console.log(`🔵 [API] Body:`, bodyCopy);
-  } else {
-    console.log(`🔵 [API] Body: N/A`);
+    if (bodyCopy.token) bodyCopy.token = '***';
+    requestLog.body = bodyCopy;
   }
-  
-  // Log auth header (masked)
-  const authHeader = req.headers.authorization;
-  if (authHeader) {
-    const tokenPreview = authHeader.substring(0, 20) + '...';
-    console.log(`🔵 [API] Authorization header: ${tokenPreview}`);
-  } else {
-    console.log(`🔵 [API] No Authorization header`);
-  }
-  
-  // Log user agent and IP
-  console.log(`🔵 [API] IP: ${req.ip || req.socket.remoteAddress}`);
-  console.log(`🔵 [API] User-Agent: ${req.get('user-agent')?.substring(0, 50)}...`);
+
+  logger.debug('Request received:', requestLog);
   
   // Capture response
   const originalSend = res.send;
   res.send = function (body) {
     const duration = Date.now() - startTime;
-    console.log(`✅ [API] ${req.method} ${req.path} - ${res.statusCode} (${duration}ms)`);
+    const responseLog: any = {
+      requestId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      duration: `${duration}ms`,
+    };
     
-    // Log error responses
+    // Log error responses with details
     if (res.statusCode >= 400) {
       try {
         const errorBody = typeof body === 'string' ? JSON.parse(body) : body;
-        console.log(`❌ [API] Error response:`, errorBody);
+        responseLog.error = errorBody;
+        logger.warn('Request error:', responseLog);
       } catch (e) {
-        console.log(`❌ [API] Error response (raw):`, body);
+        responseLog.errorBody = body;
+        logger.warn('Request error (raw):', responseLog);
       }
+    } else {
+      logger.info('Request completed:', responseLog);
     }
     
     return originalSend.call(this, body);

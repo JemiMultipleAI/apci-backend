@@ -16,7 +16,7 @@ declare global {
 
 export const authenticate = (
   req: Request,
-  res: Response,
+  _res: Response,
   next: NextFunction
 ) => {
   try {
@@ -51,7 +51,7 @@ export const authenticate = (
  */
 export const enrichUser = async (
   req: Request,
-  res: Response,
+  _res: Response,
   next: NextFunction
 ) => {
   try {
@@ -69,7 +69,7 @@ export const enrichUser = async (
 
 // Role-based authorization middleware
 export const authorize = (...roles: string[]) => {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return (req: Request, _res: Response, next: NextFunction) => {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
     }
@@ -89,7 +89,7 @@ export const authorize = (...roles: string[]) => {
 
 // Middleware to require company access
 export const requireCompanyAccess = (accountId: string) => {
-  return async (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, _res: Response, next: NextFunction) => {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
     }

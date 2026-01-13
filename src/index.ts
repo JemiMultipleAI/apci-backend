@@ -18,16 +18,22 @@ import dormantContactsRouter from './routes/dormant-contacts';
 import contactGroupsRouter from './routes/contact-groups';
 import analyticsRouter from './routes/analytics';
 import aiRouter from './routes/ai';
+import conversationsRouter from './routes/conversations';
+import campaignAnalyticsRouter from './routes/campaign-analytics';
+import inboxRouter from './routes/inbox';
+import callsRouter from './routes/calls';
 import templatesRouter from './routes/templates';
+import { websocketService } from './services/websocket';
 import importExportRouter from './routes/import-export';
 import bulkOperationsRouter from './routes/bulk-operations';
-import webhooksRouter, { setupMediaStreamsWebSocket } from './routes/webhooks';
+import webhooksRouter from './routes/webhooks';
 import aiAgentConfigsRouter from './routes/ai-agent-configs';
 import knowledgeBaseRouter from './routes/knowledge-base';
 import { connectMongoDB, disconnectMongoDB } from './db/mongodb';
 // Import campaign queue to initialize workers
 import './services/campaignQueue';
 import { initializeRedisConnection } from './services/campaignQueue';
+import { initializeCache } from './utils/cache';
 import { query } from './db/connection';
 
 const app = express();
@@ -50,8 +56,6 @@ async function checkCompletedCampaigns() {
        AND end_date IS NOT NULL 
        AND end_date <= CURRENT_TIMESTAMP`
     );
-
-    const now = new Date();
 
     for (const campaign of campaigns) {
       const metadata = typeof campaign.metadata === 'string' 
@@ -93,17 +97,62 @@ console.log('🔵 [SERVER] Request logger middleware registered');
 app.use(requestLogger);
 
 // Health check endpoint
-app.get('/health', async (req, res) => {
-  const dbConnected = await testConnection();
-  res.status(dbConnected ? 200 : 503).json({
-    status: dbConnected ? 'healthy' : 'unhealthy',
+app.get('/health', async (_req, res) => {
+  const health: any = {
+    status: 'healthy',
     timestamp: new Date().toISOString(),
-    database: dbConnected ? 'connected' : 'disconnected',
-  });
+    services: {},
+  };
+
+  let overallHealthy = true;
+
+  // Check PostgreSQL
+  try {
+    const dbConnected = await testConnection();
+    health.services.database = dbConnected ? 'connected' : 'disconnected';
+    if (!dbConnected) overallHealthy = false;
+  } catch (error: any) {
+    health.services.database = 'error';
+    health.services.databaseError = error.message;
+    overallHealthy = false;
+  }
+
+  // Check MongoDB
+  try {
+    const { isMongoDBConnected } = await import('./db/mongodb');
+    health.services.mongodb = isMongoDBConnected() ? 'connected' : 'disconnected';
+  } catch (error: any) {
+    health.services.mongodb = 'error';
+    health.services.mongodbError = error.message;
+  }
+
+  // Check Redis
+  try {
+    const { isCacheAvailable } = await import('./utils/cache');
+    health.services.redis = isCacheAvailable() ? 'connected' : 'disconnected';
+  } catch (error: any) {
+    health.services.redis = 'disconnected';
+  }
+
+  // Check external services (non-blocking)
+  try {
+    const { env } = await import('./config/env');
+    health.services.external = {
+      openai: env.OPENAI_API_KEY ? 'configured' : 'not_configured',
+      twilio: env.TWILIO_ACCOUNT_SID ? 'configured' : 'not_configured',
+      email: env.EMAIL_PROVIDER ? 'configured' : 'not_configured',
+      elevenlabs: env.ELEVENLABS_API_KEY ? 'configured' : 'not_configured',
+    };
+  } catch (error: any) {
+    health.services.external = { error: 'check_failed' };
+  }
+
+  health.status = overallHealthy ? 'healthy' : 'degraded';
+  res.status(overallHealthy ? 200 : 503).json(health);
 });
 
 // API routes
-app.get('/api', (req, res) => {
+app.get('/api', (_req, res) => {
   res.json({
         message: 'CRMatIQ API - AI Powered Customer Intelligence',
     version: '1.0.0',
@@ -128,6 +177,10 @@ app.use('/api/contact-groups', contactGroupsRouter);
 // Analytics & AI routes
 app.use('/api/analytics', analyticsRouter);
 app.use('/api/ai', aiRouter);
+app.use('/api/conversations', conversationsRouter);
+app.use('/api/campaign-analytics', campaignAnalyticsRouter);
+app.use('/api/inbox', inboxRouter);
+app.use('/api/calls', callsRouter);
 
 // Templates
 app.use('/api/templates', templatesRouter);
@@ -162,64 +215,140 @@ const startServer = async () => {
     // Initialize Redis connection (with timeout, non-blocking)
     await initializeRedisConnection();
     
+    // Initialize Redis cache (non-blocking)
+    await initializeCache().catch((error: any) => {
+      console.warn('⚠️  Redis cache initialization failed (optional):', error.message);
+    });
+    
     // Connect to MongoDB (optional, will warn if not configured)
     await connectMongoDB().catch((error) => {
       console.warn('⚠️  MongoDB connection failed (optional):', error.message);
     });
     
-    // Create HTTP server but don't start listening yet
+    // Create HTTP server
     const server = app.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`📡 API: ${env.API_BASE_URL}`);
       console.log(`🌍 Environment: ${env.NODE_ENV}`);
       
-      // Log AI Provider configuration
-      const aiProvider = env.AI_AGENT_PROVIDER || 'elevenlabs';
+      // Log AI Provider configuration (OpenAI only now, ElevenLabs agent removed - TTS only)
       const openAIKey = (env.OPENAI_API_KEY || '').trim();
       const hasOpenAIKey = openAIKey.length > 0;
       const isProjectKey = openAIKey.startsWith('sk-proj-');
       const isOpenRouter = openAIKey.startsWith('sk-or-');
       const keyType = isProjectKey ? 'Project Key' : isOpenRouter ? 'OpenRouter' : 'Standard';
-      const fallbackDisabled = env.DISABLE_ELEVENLABS_FALLBACK === true;
       
-      console.log(`\n🤖 AI Agent Provider Configuration:`);
-      console.log(`   Provider: ${aiProvider.toUpperCase()}`);
-      if (aiProvider === 'openai') {
-        if (hasOpenAIKey) {
-          console.log(`   ✅ OpenAI API Key: ${keyType} - ${openAIKey.substring(0, 15)}...`);
-          console.log(`   Model: ${env.OPENAI_MODEL}`);
-          console.log(`   Base URL: ${env.OPENAI_BASE_URL || 'https://api.openai.com/v1 (default)'}`);
-          console.log(`   Status: Ready to use OpenAI`);
-          if (fallbackDisabled) {
-            console.log(`   ⚠️  Fallback: DISABLED - OpenAI errors will NOT fallback to ElevenLabs`);
-          } else {
-            console.log(`   🔄 Fallback: ENABLED - Will fallback to ElevenLabs if OpenAI fails`);
-          }
-        } else {
-          console.log(`   ⚠️  OpenAI API Key: NOT SET`);
-          if (fallbackDisabled) {
-            console.log(`   ❌ Fallback: DISABLED - System will fail if OpenAI is not configured`);
-          } else {
-            console.log(`   Will fallback to ElevenLabs`);
-          }
-        }
+      console.log(`\n🤖 AI Agent Configuration:`);
+      console.log(`   Provider: OpenAI (ElevenLabs agent removed - TTS only)`);
+      if (hasOpenAIKey) {
+        console.log(`   ✅ OpenAI API Key: ${keyType} - ${openAIKey.substring(0, 15)}...`);
+        console.log(`   Model: ${env.OPENAI_MODEL}`);
+        console.log(`   Base URL: ${env.OPENAI_BASE_URL || 'https://api.openai.com/v1 (default)'}`);
+        console.log(`   Status: Ready`);
       } else {
-        console.log(`   ✅ Using ElevenLabs (default provider)`);
-        if (hasOpenAIKey) {
-          console.log(`   ℹ️  Note: OpenAI API key is set but AI_AGENT_PROVIDER is not 'openai'`);
-        }
+        console.log(`   ⚠️  OpenAI API Key: NOT SET`);
+        console.log(`   ⚠️  Agent functionality will not work without OpenAI API key`);
       }
       console.log(``);
     });
     
-    // Setup WebSocket server BEFORE server starts accepting connections
-    // This ensures it's ready when Twilio tries to connect
-    setupMediaStreamsWebSocket(server);
+    // CRITICAL: Handle WebSocket upgrade requests BEFORE Express processes them
+    // This prevents Express middleware from corrupting the WebSocket handshake
+    // which causes "Reserved bits are non-zero" protocol violations
+    const WebSocket = require('ws');
+    let mediaStreamsWss: any = null;
+    let generalWss: any = null;
     
-    // Small delay to ensure WebSocket server is fully initialized
-    await new Promise(resolve => setTimeout(resolve, 100));
+    // Setup Media Streams WebSocket server with manual upgrade handling
+    try {
+      mediaStreamsWss = new WebSocket.Server({
+        noServer: true, // CRITICAL: Don't auto-handle upgrades, we'll do it manually
+      });
+      
+      mediaStreamsWss.on('connection', async (ws: any, req: any) => {
+        // Extract query parameters
+        const fullUrl = req.url || '';
+        let customParameters: Record<string, string> = {};
+        
+        try {
+          const url = new URL(fullUrl, `http://${req.headers.host || 'localhost'}`);
+          url.searchParams.forEach((value, key) => {
+            customParameters[key] = value;
+          });
+        } catch (error) {
+          const queryString = fullUrl.split('?')[1];
+          if (queryString) {
+            queryString.split('&').forEach((param: string) => {
+              const [key, value] = param.split('=');
+              if (key && value) {
+                customParameters[decodeURIComponent(key)] = decodeURIComponent(value);
+              }
+            });
+          }
+        }
+        
+        // Attach to req for use in handleMediaStreamConnection
+        (req as any).customParameters = customParameters;
+        
+        // Import and use the connection handler
+        const { handleMediaStreamConnection } = await import('./services/twilioMediaStreams');
+        handleMediaStreamConnection(ws, req);
+      });
+      
+      mediaStreamsWss.on('error', (error: Error) => {
+        const { logger } = require('./utils/logger');
+        logger.error('[MEDIA_STREAM] WebSocket server error', {
+          error: error.message,
+          stack: error.stack,
+        });
+      });
+      
+      console.log('✅ Media Streams WebSocket server ready (manual upgrade handling)');
+    } catch (error: any) {
+      console.error('⚠️  Media Streams WebSocket setup failed:', error.message);
+    }
     
-    console.log('✅ WebSocket server ready for Media Streams');
+    // Setup general WebSocket server with manual upgrade handling
+    try {
+      generalWss = websocketService.initializeWithManualUpgrade();
+      console.log('✅ General WebSocket server ready (manual upgrade handling)');
+    } catch (error: any) {
+      console.error('⚠️  General WebSocket setup failed:', error.message);
+    }
+    
+    // Handle upgrade events manually - this bypasses Express middleware
+    server.on('upgrade', (request, socket, head) => {
+      const pathname = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`).pathname;
+      
+      // Route to Twilio Media Streams WebSocket
+      if (pathname === '/api/webhooks/twilio/media-streams') {
+        if (mediaStreamsWss) {
+          mediaStreamsWss.handleUpgrade(request, socket, head, (ws: any) => {
+            mediaStreamsWss.emit('connection', ws, request);
+          });
+        } else {
+          socket.destroy();
+        }
+        return;
+      }
+      
+      // Route to general WebSocket server
+      if (pathname === '/ws') {
+        if (generalWss) {
+          generalWss.handleUpgrade(request, socket, head, (ws: any) => {
+            generalWss.emit('connection', ws, request);
+          });
+        } else {
+          socket.destroy();
+        }
+        return;
+      }
+      
+      // For all other paths, close the connection (not a WebSocket path we handle)
+      socket.destroy();
+    });
+    
+    console.log('🔌 WebSocket servers initialized with manual upgrade handling');
   } catch (error) {
     console.error('Failed to start server:', error);
     process.exit(1);

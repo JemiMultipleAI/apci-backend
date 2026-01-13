@@ -9,27 +9,12 @@ const router = Router();
 // GET /api/ai/status - Check AI provider configuration and status
 router.get('/status', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const provider = env.AI_AGENT_PROVIDER || 'elevenlabs';
-    const hasOpenAIKey = !!env.OPENAI_API_KEY;
+    const hasOpenAIKey = !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
     const openAIKeyPrefix = env.OPENAI_API_KEY ? env.OPENAI_API_KEY.substring(0, 7) + '...' : 'not set';
     const openAIKeyLength = env.OPENAI_API_KEY?.length || 0;
     
-    // Determine which provider will be used
-    let activeProvider: 'openai' | 'elevenlabs';
-    let reason: string;
-    
-    if (provider === 'openai' && hasOpenAIKey) {
-      activeProvider = 'openai';
-      reason = 'OpenAI is configured and API key is present';
-    } else if (provider === 'openai' && !hasOpenAIKey) {
-      activeProvider = 'elevenlabs';
-      reason = 'AI_AGENT_PROVIDER is set to openai but OPENAI_API_KEY is missing';
-    } else {
-      activeProvider = 'elevenlabs';
-      reason = provider === 'elevenlabs' ? 'Default provider (ElevenLabs)' : 'AI_AGENT_PROVIDER not set, using default';
-    }
-    
-    const fallbackDisabled = env.DISABLE_ELEVENLABS_FALLBACK === true;
+    const activeProvider = 'openai';
+    const reason = hasOpenAIKey ? 'OpenAI is configured and ready' : 'OpenAI API key is missing';
     const isProjectKey = env.OPENAI_API_KEY?.startsWith('sk-proj-');
     const isOpenRouter = env.OPENAI_API_KEY?.startsWith('sk-or-');
     const isCustomBaseURL = !!env.OPENAI_BASE_URL;
@@ -37,18 +22,10 @@ router.get('/status', authenticate, async (req: Request, res: Response, next: Ne
     res.json({
       success: true,
       data: {
-        configuredProvider: provider,
-        activeProvider,
+        provider: activeProvider,
         reason,
-        fallback: {
-          disabled: fallbackDisabled,
-          willFallback: !fallbackDisabled && (provider !== 'openai' || !hasOpenAIKey),
-          note: fallbackDisabled 
-            ? 'Fallback to ElevenLabs is DISABLED. OpenAI errors will not fallback.' 
-            : 'Fallback to ElevenLabs is ENABLED. Will fallback if OpenAI fails.',
-        },
+        note: 'ElevenLabs agent removed - using OpenAI only (ElevenLabs TTS remains)',
         openai: {
-          configured: provider === 'openai',
           apiKeyPresent: hasOpenAIKey,
           apiKeyPrefix: openAIKeyPrefix,
           apiKeyLength: openAIKeyLength,
@@ -60,11 +37,10 @@ router.get('/status', authenticate, async (req: Request, res: Response, next: Ne
           status: hasOpenAIKey ? 'ready' : 'missing_api_key',
         },
         elevenlabs: {
-          configured: provider === 'elevenlabs' || activeProvider === 'elevenlabs',
           apiKeyPresent: !!env.ELEVENLABS_API_KEY,
           voiceId: env.ELEVENLABS_VOICE_ID || 'default',
           status: env.ELEVENLABS_API_KEY ? 'ready' : 'missing_api_key',
-          fallbackAvailable: !fallbackDisabled,
+          note: 'TTS only (agent removed)',
         },
       },
     });

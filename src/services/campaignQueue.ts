@@ -1,9 +1,9 @@
 import Bull from 'bull';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
-import { sendEmailFromTemplate } from './email';
-import { sendSMSFromTemplate } from './sms';
-import { makeVoiceCallFromTemplate, replaceTemplateVariables } from './voice';
+import { sendEmailFromTemplate, sendEmailWithAI } from './email';
+import { sendSMSFromTemplate, sendSMSWithAI } from './sms';
+import { makeVoiceCallFromTemplate } from './voice';
 import { query, queryOne } from '../db/connection';
 import { createWebhookToken, generateReplyToEmail } from './webhookTokens';
 
@@ -106,9 +106,9 @@ export interface CampaignJobData {
   campaignId: string;
   contactId: string;
   channel: 'email' | 'sms' | 'call';
-  templateId?: string;
+  templateId?: string; // Deprecated - kept for backward compatibility
   surveyId?: string;
-  variables: Record<string, string>;
+  variables: Record<string, string>; // Deprecated - AI handles personalization
   userId?: string;
   accountId?: string;
 }
@@ -119,6 +119,7 @@ export interface CampaignJobData {
 logger.info('[CAMPAIGN_QUEUE] Queue processor registered for "campaign-message" jobs');
 campaignQueue.process('campaign-message', 1, async (job) => {
   const { campaignId, contactId, channel, templateId, surveyId, variables, userId, accountId } = job.data as CampaignJobData;
+  // Note: templateId is deprecated but kept for backward compatibility with old campaigns
 
   try {
     logger.info('[CAMPAIGN_QUEUE] Processing job', {
@@ -130,26 +131,60 @@ campaignQueue.process('campaign-message', 1, async (job) => {
     });
 
     // Get contact
-    const contact = await queryOne('SELECT * FROM contacts WHERE id = $1', [contactId]);
+    const contact = await queryOne<{
+      id: string;
+      account_id: string | null;
+      first_name: string;
+      last_name: string;
+      email: string | null;
+      mobile: string | null;
+      [key: string]: any; // Allow other fields from SELECT *
+    }>('SELECT * FROM contacts WHERE id = $1', [contactId]);
     if (!contact) {
       throw new Error(`Contact ${contactId} not found`);
     }
 
     // Get campaign
-    const campaign = await queryOne('SELECT * FROM campaigns WHERE id = $1', [campaignId]);
+    const campaign = await queryOne<{
+      id: string;
+      name: string;
+      instructions?: string | null;
+      custom_introduction?: string | null;
+      use_custom_introduction?: boolean;
+      [key: string]: any;
+    }>('SELECT * FROM campaigns WHERE id = $1', [campaignId]);
     if (!campaign) {
       throw new Error(`Campaign ${campaignId} not found`);
+    }
+
+    // CRITICAL: Ensure accountId is available - get from contact if not provided in job data
+    // This ensures the agent gets CRM context (campaigns, deals, contact info) for all channels
+    const effectiveAccountId = accountId || contact.account_id || null;
+    if (!effectiveAccountId) {
+      logger.warn('[CAMPAIGN_QUEUE] No accountId available - agent will not have CRM context', {
+        campaignId,
+        contactId,
+        channel,
+        note: 'Contact has no account_id and job data has no accountId - agent responses will be generic',
+      });
+    } else if (!accountId && contact.account_id) {
+      logger.info('[CAMPAIGN_QUEUE] Using accountId from contact', {
+        accountId: effectiveAccountId,
+        contactId,
+        channel,
+        note: 'accountId was missing from job data, retrieved from contact.account_id',
+      });
     }
 
     let webhookToken: { id: string; token: string } | null = null;
     let replyToEmail: string | undefined;
 
     // Generate webhook token for inbound replies (if account ID is available)
-    if (accountId && (channel === 'email' || channel === 'sms')) {
+    if (effectiveAccountId && (channel === 'email' || channel === 'sms')) {
       try {
         const tokenType = channel === 'email' ? 'email' : 'sms';
         const token = await createWebhookToken({
-          account_id: accountId,
+          account_id: effectiveAccountId,
           campaign_id: campaignId,
           contact_id: contactId,
           type: tokenType,
@@ -226,8 +261,8 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           throw new Error('Contact has no mobile number');
         }
 
-        // Check if OpenAI is configured for agent mode
-        const useAgentForOpenAI = env.AI_AGENT_PROVIDER === 'openai' && !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
+        // Check if OpenAI is configured for agent mode (always use OpenAI now)
+        const useAgentForOpenAI = !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
 
         // Try to get agent config for the account (for ElevenLabs compatibility)
         let agentId: string | undefined;
@@ -235,23 +270,23 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           // For OpenAI, use a placeholder agent ID
           agentId = `openai-survey-${survey.id.substring(0, 8)}`;
           logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode for survey call', {
-            accountId: accountId || 'no-account',
+            accountId: effectiveAccountId || 'no-account',
             surveyId: survey.id,
           });
-        } else if (accountId) {
+        } else if (effectiveAccountId) {
           try {
             const agentConfig = await queryOne<{ agent_id: string }>(
               `SELECT agent_id FROM ai_agent_configurations 
                WHERE account_id = $1 AND is_active = true 
                LIMIT 1`,
-              [accountId]
+              [effectiveAccountId]
             );
             if (agentConfig) {
               agentId = agentConfig.agent_id;
             }
           } catch (error: any) {
             logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config for survey call, using simple TTS', {
-              accountId,
+              accountId: effectiveAccountId,
               error: error.message,
             });
           }
@@ -270,7 +305,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           undefined, // voiceId
           agentId,
           contactId,
-          accountId,
+          effectiveAccountId || undefined, // Pass effectiveAccountId to voice call
           useAgent
         );
 
@@ -283,50 +318,60 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           throw new Error(result.error || 'Failed to make voice call');
         }
       }
-    } else if (templateId) {
-      // Get template
-      const template = await queryOne('SELECT * FROM templates WHERE id = $1', [templateId]);
-      if (!template) {
-        throw new Error(`Template ${templateId} not found`);
-      }
-
+    } else if (campaign.instructions) {
+      // Use AI-generated personalized content
       if (channel === 'email') {
         if (!contact.email) {
           throw new Error('Contact has no email address');
         }
 
-        result = await sendEmailFromTemplate(
+        // Get custom introduction if enabled
+        const customIntroduction = campaign.use_custom_introduction && campaign.custom_introduction
+          ? campaign.custom_introduction
+          : undefined;
+
+        result = await sendEmailWithAI(
           contact.email,
-          template.subject || campaign.name,
-          template.body,
-          variables,
-          undefined,
-          replyToEmail
+          campaign.name, // Use campaign name as subject
+          campaign.instructions,
+          contactId,
+          effectiveAccountId || undefined,
+          campaignId,
+          replyToEmail,
+          customIntroduction
         );
 
         if (result.success) {
           activityType = 'email';
-          activitySubject = template.subject || campaign.name;
-          activityDescription = `Sent email: ${template.subject || campaign.name}`;
+          activitySubject = campaign.name;
+          activityDescription = `Sent AI-generated email: ${campaign.name}`;
         } else {
-          throw new Error(result.error || 'Failed to send email');
+          throw new Error(result.error || 'Failed to send AI email');
         }
       } else if (channel === 'sms') {
         if (!contact.mobile) {
           throw new Error('Contact has no mobile number');
         }
 
-        result = await sendSMSFromTemplate(
+        // Get custom introduction if enabled (reuse from email section if already set)
+        const customIntroduction = campaign.use_custom_introduction && campaign.custom_introduction
+          ? campaign.custom_introduction
+          : undefined;
+
+        result = await sendSMSWithAI(
           contact.mobile,
-          template.body,
-          variables
+          campaign.instructions,
+          contactId,
+          effectiveAccountId || undefined,
+          campaignId,
+          customIntroduction
         );
 
         if (result.success) {
           activityType = 'sms';
-          activityDescription = `Sent SMS: ${template.name}`;
+          activityDescription = `Sent AI-generated SMS: ${campaign.name}`;
         } else {
-          throw new Error(result.error || 'Failed to send SMS');
+          throw new Error(result.error || 'Failed to send AI SMS');
         }
       } else if (channel === 'call') {
         if (!contact.mobile) {
@@ -336,12 +381,12 @@ campaignQueue.process('campaign-message', 1, async (job) => {
         logger.info('[CAMPAIGN_QUEUE] Processing call campaign', {
           campaignId: campaign.id,
           contactId: contact.id,
-          accountId,
+          accountId: effectiveAccountId,
           mobile: contact.mobile,
         });
 
-        // Check if OpenAI is configured for agent mode
-        const useAgentForOpenAI = env.AI_AGENT_PROVIDER === 'openai' && !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
+        // Check if OpenAI is configured for agent mode (always use OpenAI now)
+        const useAgentForOpenAI = !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
 
         // Try to get agent config for the account (for ElevenLabs compatibility)
         let agentId: string | undefined;
@@ -349,43 +394,41 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           // For OpenAI, we don't need a database agent ID - use a placeholder
           // The actual agent logic is handled by agentService which uses OpenAI Chat API
           agentId = `openai-${campaign.id.substring(0, 8)}`; // Placeholder agent ID
-          logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode (no database agent config needed)', {
-            accountId: accountId || 'no-account',
+          logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode', {
+            accountId: effectiveAccountId || 'no-account',
             agentId: agentId.substring(0, 15) + '...',
-            aiProvider: env.AI_AGENT_PROVIDER,
             openAIModel: env.OPENAI_MODEL,
           });
-        } else if (accountId) {
+        } else if (effectiveAccountId) {
           // Fallback: Try to get agent config from database (for ElevenLabs compatibility)
           try {
-            logger.debug('[CAMPAIGN_QUEUE] Looking up agent config from database', { accountId });
+            logger.debug('[CAMPAIGN_QUEUE] Looking up agent config from database', { accountId: effectiveAccountId });
             const agentConfig = await queryOne<{ agent_id: string }>(
               `SELECT agent_id FROM ai_agent_configurations 
                WHERE account_id = $1 AND is_active = true 
                LIMIT 1`,
-              [accountId]
+              [effectiveAccountId]
             );
             if (agentConfig) {
               agentId = agentConfig.agent_id;
               logger.info('[CAMPAIGN_QUEUE] Agent config found in database', {
-                accountId,
+                accountId: effectiveAccountId,
                 agentId: agentId.substring(0, 8) + '...',
               });
             } else {
               logger.info('[CAMPAIGN_QUEUE] No agent config found in database, will use simple TTS', {
-                accountId,
+                accountId: effectiveAccountId,
               });
             }
           } catch (error: any) {
             logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config from database, using simple TTS call', {
-              accountId,
+              accountId: effectiveAccountId,
               error: error.message,
             });
           }
         } else if (!useAgentForOpenAI) {
-          logger.warn('[CAMPAIGN_QUEUE] No accountId and OpenAI not configured, cannot use agent', {
+          logger.warn('[CAMPAIGN_QUEUE] OpenAI not configured, cannot use agent', {
             campaignId: campaign.id,
-            aiProvider: env.AI_AGENT_PROVIDER || 'not-set',
             hasOpenAIKey: !!env.OPENAI_API_KEY,
           });
         }
@@ -395,35 +438,42 @@ campaignQueue.process('campaign-message', 1, async (job) => {
         logger.info('[CAMPAIGN_QUEUE] Call configuration', {
           useAgent,
           agentId: agentId ? agentId.substring(0, 8) + '...' : 'none',
-          hasScript: !!template.body,
+          hasInstructions: !!campaign.instructions,
+          note: 'Campaign uses instructions field - AI will personalize conversation',
         });
 
-        // IMPORTANT: For agent calls, do NOT pass the template script
-        // Agent mode goes straight to AI conversation without template playback
-        // For non-agent calls, use template as the full script
-        const callScript = useAgent ? undefined : replaceTemplateVariables(template.body, variables);
+        // IMPORTANT: For campaigns with instructions, always use agent mode
+        // Instructions are for AI-generated personalized content, not template scripts
+        // Pass undefined for script - agent mode goes straight to AI conversation
+        const callScript = undefined;
 
         try {
           logger.info('[CAMPAIGN_QUEUE] Making voice call', {
             to: contact.mobile,
             useAgent,
             agentId: agentId ? agentId.substring(0, 8) + '...' : undefined,
-            hasScript: !!callScript,
+            hasInstructions: !!campaign.instructions,
             note: useAgent 
-              ? '✅ Agent mode - NO template script, goes straight to AI agent conversation'
-              : 'Non-agent mode - will play template script',
+              ? '✅ Agent mode - AI will use campaign instructions to personalize conversation'
+              : '⚠️ Warning: OpenAI not configured, but campaign has instructions - call may not work as expected',
           });
+
+          // Get custom introduction if enabled
+          const customIntroduction = campaign.use_custom_introduction && campaign.custom_introduction
+            ? campaign.custom_introduction
+            : undefined;
 
           result = await makeVoiceCallFromTemplate(
             contact.mobile,
-            callScript, // Pass undefined for agent calls (no template), script for non-agent calls
+            callScript, // Always undefined for instructions-based campaigns
             variables,
             undefined, // from
             undefined, // voiceId
             agentId,
             contactId,
-            accountId,
-            useAgent
+            effectiveAccountId || undefined, // Pass effectiveAccountId to voice call - ensures agent gets CRM context
+            useAgent,
+            customIntroduction
           );
 
           logger.info('[CAMPAIGN_QUEUE] Voice call result', {
@@ -436,8 +486,8 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           if (result.success) {
             activityType = 'call';
             activityDescription = useAgent 
-              ? `Made AI agent call: ${template.name}` 
-              : `Made call: ${template.name}`;
+              ? `Made AI agent call: ${campaign.name}` 
+              : `Made call: ${campaign.name}`;
           } else {
             throw new Error(result.error || 'Failed to make voice call');
           }
@@ -452,7 +502,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
         }
       }
     } else {
-      throw new Error('Either templateId or surveyId must be provided');
+      throw new Error('Either instructions or surveyId must be provided');
     }
 
     // Create activity record
@@ -462,7 +512,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
       ...(campaign.type && { campaign_type: campaign.type }), // Deprecated, kept for backward compatibility
       campaign_channel: channel,
       ...(surveyId && { survey_id: surveyId }),
-      ...(templateId && { template_id: templateId }),
+      ...(templateId && { template_id: templateId }), // Deprecated, kept for backward compatibility
     };
 
     if (result?.success) {
@@ -679,7 +729,6 @@ export async function initializeRedisConnection(): Promise<void> {
     if (isReady) {
       const connectionInfo = getRedisConnectionInfo();
       logger.info('[CAMPAIGN_QUEUE] Redis connected and queue ready', connectionInfo);
-      console.log('✅ Redis connected successfully');
     } else {
       throw new Error('Redis queue is not ready');
     }
@@ -690,9 +739,9 @@ export async function initializeRedisConnection(): Promise<void> {
       error: error.message,
       stack: error.stack,
     });
-    logger.warn('[CAMPAIGN_QUEUE] Campaign execution will fail without Redis. Please ensure Redis is running.');
-    console.error('❌ Redis connection failed:', error.message);
-    console.warn('⚠️  Campaign execution will not work without Redis');
+    logger.warn('[CAMPAIGN_QUEUE] Campaign execution will fail without Redis. Please ensure Redis is running.', {
+      error: error.message,
+    });
     // Don't throw - allow server to start but campaigns won't work
   }
 }

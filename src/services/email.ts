@@ -2,6 +2,8 @@ import { env } from '../config/env';
 import sgMail from '@sendgrid/mail';
 import { Resend } from 'resend';
 import { logger } from '../utils/logger';
+import { sendMessageToAgent } from './agentService';
+import { upsertConversation, addMessageToConversation } from './conversationService';
 
 export interface EmailOptions {
   to: string;
@@ -136,3 +138,128 @@ export const sendEmailFromTemplate = async (
   });
 };
 
+/**
+ * Send AI-generated personalized email
+ * Uses OpenAI to generate personalized content based on campaign instructions
+ */
+export const sendEmailWithAI = async (
+  to: string,
+  subject: string,
+  instructions: string,
+  contactId: string,
+  accountId?: string,
+  campaignId?: string,
+  replyTo?: string,
+  customIntroduction?: string
+): Promise<EmailResult> => {
+  try {
+    logger.info('[EMAIL_AI] Generating personalized email', {
+      to,
+      contactId,
+      accountId,
+      campaignId,
+      instructionsLength: instructions.length,
+    });
+
+    // Create prompt for the agent based on campaign instructions
+    const agentPrompt = `Generate a personalized email message based on these campaign instructions:
+
+${instructions}
+
+Please create a friendly, professional email that:
+- Personalizes the message based on the customer's context
+- Follows the campaign instructions provided above
+- Is concise and engaging
+- Uses appropriate tone for the campaign purpose
+
+Generate only the email body content (not the subject line).`;
+
+    // Use a placeholder agent ID for campaigns (OpenAI doesn't need a real agent ID)
+    const agentId = `openai-campaign-${campaignId?.substring(0, 8) || 'default'}`;
+
+    // Generate personalized content using the agent
+    const agentResponse = await sendMessageToAgent(
+      agentId,
+      agentPrompt,
+      undefined, // agentConfigId - not needed for campaigns
+      contactId,
+      accountId
+    );
+
+    if (!agentResponse.success || !agentResponse.response) {
+      const error = agentResponse.error || 'Failed to generate email content';
+      logger.error('[EMAIL_AI] Failed to generate email content', {
+        contactId,
+        accountId,
+        error,
+      });
+      return {
+        success: false,
+        error,
+      };
+    }
+
+    const emailBody = agentResponse.response.trim();
+    const finalEmailBody = customIntroduction ? `${customIntroduction}\n\n${emailBody}` : emailBody;
+
+    // Send the generated email
+    const result = await sendEmail({
+      to,
+      subject,
+      html: finalEmailBody,
+      replyTo,
+    });
+
+    // Store conversation in MongoDB if accountId and contactId are available
+    if (result.success && accountId && contactId) {
+      try {
+        const conversation = await upsertConversation(
+          contactId,
+          accountId,
+          'email',
+          campaignId
+        );
+
+        await addMessageToConversation(
+          conversation._id.toString(),
+          'assistant',
+          finalEmailBody,
+          {
+            message_id: result.messageId,
+            tokens_used: undefined, // Could extract from agentResponse if available
+          }
+        );
+
+        logger.debug('[EMAIL_AI] Conversation stored in MongoDB', {
+          conversationId: conversation._id,
+          contactId,
+        });
+      } catch (error: any) {
+        // Log error but don't fail the email send
+        logger.warn('[EMAIL_AI] Failed to store conversation', {
+          error: error.message,
+          contactId,
+          accountId,
+        });
+      }
+    }
+
+    logger.info('[EMAIL_AI] Email sent successfully', {
+      to,
+      contactId,
+      messageId: result.messageId,
+    });
+
+    return result;
+  } catch (error: any) {
+    logger.error('[EMAIL_AI] Error sending AI-generated email', {
+      error: error.message,
+      to,
+      contactId,
+    });
+    return {
+      success: false,
+      error: error.message || 'Failed to send AI-generated email',
+    };
+  }
+};

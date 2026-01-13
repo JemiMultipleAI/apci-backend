@@ -13,6 +13,7 @@ export interface VoiceCallOptions {
   contactId?: string; // Contact ID for context
   accountId?: string; // Account ID for agent config lookup
   useAgent?: boolean; // Whether to use agent (Media Streams) or simple TTS
+  customIntroduction?: string; // Custom introduction/greeting for agent calls
 }
 
 export interface VoiceCallResult {
@@ -119,9 +120,8 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
           contactId: options.contactId,
           accountId: options.accountId,
           sttProvider: env.STT_PROVIDER || 'openai',
-          aiProvider: env.AI_AGENT_PROVIDER || 'elevenlabs',
+          aiProvider: 'openai',
           useAgentFromOptions: useAgent,
-          note: 'Agent mode enabled - campaignQueue already validated OpenAI configuration',
         });
 
         if (!env.PUBLIC_WEBHOOK_URL) {
@@ -177,6 +177,18 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
         if (options.accountId) {
           customParams.account_id = options.accountId;
         }
+        if (options.customIntroduction) {
+          customParams.customIntroduction = options.customIntroduction;
+        }
+
+        // Validate required parameters
+        if (!effectiveAgentId) {
+          logger.error('[VOICE] CRITICAL: effectiveAgentId is missing - Media Streams will fail', {
+            optionsAgentId: options.agentId,
+            useAgent,
+            note: 'This will cause the WebSocket to close immediately as no agent_id will be in TwiML',
+          });
+        }
 
         // Create TwiML with Media Streams
         // Note: Twilio Media Streams passes custom parameters via the 'parameter' attributes in TwiML
@@ -186,7 +198,13 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
           baseUrl: baseUrl,
           originalPublicWebhookUrl: env.PUBLIC_WEBHOOK_URL,
           customParameters: customParams,
+          customParametersCount: Object.keys(customParams).length,
+          hasAgentId: !!customParams.agent_id,
+          hasContactId: !!customParams.contact_id,
+          hasAccountId: !!customParams.account_id,
+          hasCustomIntroduction: !!customParams.customIntroduction,
           hasScript: !!options.script,
+          effectiveAgentId: effectiveAgentId ? effectiveAgentId.substring(0, 20) + '...' : 'MISSING',
         });
         
         // REVERTED: Back to <Connect><Stream> - <Start><Stream> broke initial conversation
@@ -203,12 +221,35 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
         
         // Add custom parameters as parameter attributes
         // Twilio will include these in the start event's customParameters field
+        logger.debug('[VOICE] Adding parameters to TwiML Stream', {
+          parameterCount: Object.keys(customParams).length,
+          parameters: Object.keys(customParams),
+        });
+        
         Object.entries(customParams).forEach(([key, value]) => {
+          if (!value) {
+            logger.warn('[VOICE] Skipping empty parameter value', { key });
+            return;
+          }
           stream.parameter({
             name: key,
             value: value,
           });
+          logger.debug('[VOICE] Added parameter to TwiML', {
+            key,
+            valueLength: value.length,
+            valuePreview: value.substring(0, 50) + (value.length > 50 ? '...' : ''),
+          });
         });
+        
+        // Validate that agent_id was added
+        if (!customParams.agent_id) {
+          logger.error('[VOICE] CRITICAL: agent_id parameter was not added to TwiML', {
+            customParams,
+            effectiveAgentId,
+            note: 'This will cause the WebSocket to close immediately',
+          });
+        }
 
         // Note: <Connect> blocks execution, so <Say> and <Pause> won't execute
         // The stream starts immediately and goes directly to the AI agent
@@ -221,10 +262,19 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
         const trackValueMatch = twimlString.match(/track="?([^"\s>]+)"?/);
         const trackValue = trackValueMatch ? trackValueMatch[1] : 'NOT FOUND';
         
+        // Check for parameter elements
+        const parameterMatches = twimlString.match(/<Parameter[^>]*>/g) || [];
+        const parameterCount = parameterMatches.length;
+        const hasAgentIdParam = twimlString.includes('name="agent_id"') || twimlString.includes("name='agent_id'");
+        
         logger.info('[VOICE] Generated TwiML for Media Stream (using <Connect><Stream>)', {
           twiml: twimlString,
           hasTrackAttribute,
           trackValue,
+          parameterCount,
+          hasAgentIdParam,
+          allParameters: parameterMatches,
+          mediaStreamUrl,
           hasInboundTrack: trackValue === 'inbound_track',
           note: hasTrackAttribute && trackValue === 'inbound_track'
             ? '✅ TwiML correctly includes track="inbound_track" - should receive caller audio'
@@ -355,13 +405,15 @@ export const makeVoiceCallFromTemplate = async (
   agentId?: string,
   contactId?: string,
   accountId?: string,
-  useAgent?: boolean
+  useAgent?: boolean,
+  customIntroduction?: string
 ): Promise<VoiceCallResult> => {
   const processedScript = script ? replaceTemplateVariables(script, variables) : undefined;
 
   return makeVoiceCall({
     to,
     script: processedScript,
+    customIntroduction,
     from,
     voiceId,
     agentId,

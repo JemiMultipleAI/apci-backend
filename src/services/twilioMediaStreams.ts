@@ -99,24 +99,22 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
     }
   }
 
-  // Clear timeout once connection is established
-  ws.on('open', () => {
+  // CRITICAL: Check if WebSocket is already OPEN when handler is attached
+  // If so, handle it synchronously (the 'open' event won't fire)
+  if (ws.readyState === WebSocket.OPEN) {
     clearTimeout(connectionTimeout);
     connectionStats.successful++;
-    logger.debug('[MEDIA_STREAM] WebSocket opened successfully', {
+    logger.debug('[MEDIA_STREAM] WebSocket already OPEN when handler attached', {
       totalAttempts: connectionStats.totalAttempts,
       successful: connectionStats.successful,
-      failed: connectionStats.failed,
-      active: connectionStats.active,
+      readyState: ws.readyState,
+      note: 'Connection was already open - will not receive "open" event',
     });
-  });
+  }
 
-  logger.info('[MEDIA_STREAM] WebSocket connection established', {
-    url: req.url,
-    customParameters: Object.keys(customParameters).length > 0 ? customParameters : 'none',
-    readyState: ws.readyState,
-  });
-
+  // CRITICAL: Attach message handler FIRST, before any other handlers
+  // This ensures we catch Twilio's immediate 'connected' event
+  // Twilio sends 'connected' event immediately after WebSocket opens
   ws.on('message', (data: WebSocket.Data) => {
     try {
       const message: MediaStreamMessage = JSON.parse(data.toString());
@@ -161,12 +159,14 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
               const agentId = startCustomParams.agent_id;
               const contactId = startCustomParams.contact_id;
               const accountId = startCustomParams.account_id;
+              const customIntroduction = startCustomParams.customIntroduction;
               
               logger.info('[MEDIA_STREAM] Extracted custom parameters', {
                 callSid: message.start.callSid,
                 agentId: agentId || 'MISSING',
                 contactId: contactId || 'MISSING',
                 accountId: accountId || 'MISSING',
+                hasCustomIntroduction: !!customIntroduction,
               });
               
               if (agentId) {
@@ -176,7 +176,8 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
                     connection!,
                     agentId,
                     contactId,
-                    accountId
+                    accountId,
+                    customIntroduction
                   ).catch((error: any) => {
                     logger.error('[MEDIA_STREAM] Failed to start bridge', {
                       callSid: connection!.callSid,
@@ -313,6 +314,24 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
         stack: error.stack,
       });
     }
+  });
+
+  // Attach 'open' handler (will fire if connection is still CONNECTING)
+  ws.on('open', () => {
+    clearTimeout(connectionTimeout);
+    connectionStats.successful++;
+    logger.debug('[MEDIA_STREAM] WebSocket opened successfully', {
+      totalAttempts: connectionStats.totalAttempts,
+      successful: connectionStats.successful,
+      failed: connectionStats.failed,
+      active: connectionStats.active,
+    });
+  });
+
+  logger.info('[MEDIA_STREAM] WebSocket connection established', {
+    url: req.url,
+    customParameters: Object.keys(customParameters).length > 0 ? customParameters : 'none',
+    readyState: ws.readyState,
   });
 
   ws.on('error', (error: Error) => {

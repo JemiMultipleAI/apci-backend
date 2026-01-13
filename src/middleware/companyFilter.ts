@@ -17,7 +17,7 @@ export interface CompanyFilter {
  * Adds req.companyFilter with the appropriate WHERE clause
  */
 export const applyCompanyFilter = (tableAlias: string = '') => {
-  return async (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, _res: Response, next: NextFunction) => {
     try {
       if (!req.user) {
         return next(createError('Unauthorized', 401));

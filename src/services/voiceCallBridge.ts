@@ -4,6 +4,7 @@ import { sendAudioToStream, MediaStreamConnection } from './twilioMediaStreams';
 import { createSTTStream, STTStream, STTResult } from './speechToText';
 import { ensureUlawFormat, isMp3Format } from '../utils/audioConverter';
 import { sendMessageToAgent } from './agentService'; // Use unified agent service (OpenAI Chat API)
+import { upsertConversation, addMessageToConversation } from './conversationService';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { ElevenLabsClient } = require('elevenlabs');
 
@@ -12,6 +13,7 @@ interface VoiceCallBridge {
   agentId: string; // Agent config ID (used for context, not WebSocket)
   contactId?: string;
   accountId?: string;
+  conversationId?: string; // MongoDB conversation document ID
   audioBuffer: Buffer[];
   textBuffer: string;
   lastSttTime: number;
@@ -45,7 +47,8 @@ export async function startVoiceCallBridge(
   streamConnection: MediaStreamConnection,
   agentId: string,
   contactId?: string,
-  accountId?: string
+  accountId?: string,
+  customIntroduction?: string
 ): Promise<void> {
   const callSid = streamConnection.callSid;
   const voiceId = env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
@@ -54,9 +57,14 @@ export async function startVoiceCallBridge(
     callSid,
     agentId: agentId.substring(0, 8) + '...',
     contactId,
-    accountId,
+    accountId: accountId || 'MISSING',
+    hasAccountId: !!accountId,
+    hasContactId: !!contactId,
     sttProvider: env.STT_PROVIDER || 'openai',
-    aiProvider: env.AI_AGENT_PROVIDER || 'openai',
+    aiProvider: 'openai',
+    note: accountId 
+      ? '✅ Agent will have CRM context (campaigns, deals, contact info)' 
+      : '⚠️ No accountId - agent will NOT have CRM context (generic responses only)',
   });
 
   // Initialize ElevenLabs TTS client
@@ -143,15 +151,21 @@ export async function startVoiceCallBridge(
   // Send initial greeting/context message to the AI agent
   // This will trigger the AI to respond with a greeting so the caller hears something immediately
   if (ttsClient && env.OPENAI_API_KEY) {
+    // Use custom introduction if provided, otherwise use default greeting
+    const greetingMessage = customIntroduction && customIntroduction.trim()
+      ? customIntroduction.trim()
+      : 'The caller has just connected to the call. Please introduce yourself briefly and ask how you can help them today.';
+    
     logger.info('[VOICE_BRIDGE] Sending initial greeting to AI agent', { 
       callSid,
       hasTtsClient: !!ttsClient,
       hasOpenAIKey: !!env.OPENAI_API_KEY,
+      hasCustomIntroduction: !!customIntroduction,
+      greetingLength: greetingMessage.length,
     });
     
     // Send initial greeting to trigger AI response
-    // Use a simple, friendly message that will prompt the AI to introduce itself
-    sendTextToAgent(callSid, 'The caller has just connected to the call. Please introduce yourself briefly and ask how you can help them today.').catch((error: any) => {
+    sendTextToAgent(callSid, greetingMessage).catch((error: any) => {
       logger.error('[VOICE_BRIDGE] Failed to send initial greeting to agent', { 
         callSid, 
         error: error.message,
@@ -408,9 +422,17 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
       callSid,
       text: text.substring(0, 150),
       textLength: text.length,
+      hasAccountId: !!bridge.accountId,
+      hasContactId: !!bridge.contactId,
+      note: bridge.accountId && bridge.contactId
+        ? '✅ Agent will have full CRM context (campaigns, deals, contact info, conversation history)'
+        : bridge.accountId
+        ? '⚠️ Has accountId but no contactId - will have campaigns/deals but limited contact context'
+        : '❌ No accountId - agent will NOT have CRM context (generic responses only)',
     });
 
     // Use unified agent service (OpenAI Chat API)
+    // Pass accountId and contactId to get CRM context (same as SMS/Email)
     const response = await sendMessageToAgent(
       bridge.agentId,
       text,
@@ -435,6 +457,41 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
         responseLength: response.response.length,
         responsePreview: response.response.substring(0, 150),
       });
+      
+      // Store AI response in conversation
+      if (bridge.contactId && bridge.accountId) {
+        try {
+          // Ensure conversation exists
+          if (!bridge.conversationId) {
+            const conversation = await upsertConversation(
+              bridge.contactId,
+              bridge.accountId,
+              'call',
+              undefined,
+              undefined
+            );
+            bridge.conversationId = conversation._id.toString();
+          }
+          
+          // Add assistant message to conversation
+          if (bridge.conversationId) {
+            await addMessageToConversation(
+              bridge.conversationId,
+              'assistant',
+              response.response,
+              {
+                message_id: callSid,
+                // tokens_used not available in AgentResponse, but can be enhanced later
+              }
+            );
+          }
+        } catch (error: any) {
+          logger.error('[VOICE_BRIDGE] Failed to store AI response', error, {
+            callSid,
+            note: 'Call continues despite conversation storage failure',
+          });
+        }
+      }
       
       await sendAgentResponseAsAudio(callSid, response.response);
       // Don't reset isWaitingForResponse here - let sendAgentResponseAsAudio handle it

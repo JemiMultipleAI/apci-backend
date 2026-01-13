@@ -40,12 +40,10 @@ const envSchema = z.object({
   JWT_EXPIRES_IN: z.string().default('15m'),
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
 
-  // AI Services
-  AI_AGENT_PROVIDER: z.enum(['elevenlabs', 'openai']).default('elevenlabs'), // Agent provider for conversational AI (defaults to ElevenLabs for backward compatibility)
+  // AI Services (OpenAI for agent, ElevenLabs for TTS only)
   OPENAI_API_KEY: z.string().optional().transform((val) => val?.trim()), // Trim whitespace/newlines from API key
   OPENAI_MODEL: z.string().default('gpt-4o-mini'), // OpenAI model to use (gpt-4o-mini, gpt-3.5-turbo, gpt-4-turbo, etc.)
   OPENAI_BASE_URL: z.string().url().optional(), // Custom base URL (for OpenRouter, etc.) - defaults to https://api.openai.com/v1
-  DISABLE_ELEVENLABS_FALLBACK: z.string().default('false').transform((val) => val === 'true' || val === '1'), // Disable ElevenLabs fallback for testing (set to 'true' to disable fallback)
   ANTHROPIC_API_KEY: z.string().optional(),
   // Voice Service
   VOICE_PROVIDER: z.enum(['elevenlabs', 'twilio']).optional(),

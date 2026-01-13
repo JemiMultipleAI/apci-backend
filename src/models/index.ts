@@ -99,6 +99,7 @@ export interface Survey {
   questions: any; // JSONB
   created_by: string | null;
   is_active: boolean;
+  development_status?: 'stable' | 'beta' | 'under_development' | 'deprecated';
   created_at: Date;
   updated_at: Date;
 }
@@ -136,6 +137,8 @@ export interface Campaign {
   created_by: string | null;
   start_date: Date | null;
   end_date: Date | null;
+  instructions?: string; // AI prompt/instructions for personalized content generation
+  // template_id?: string; // Deprecated - kept for backward compatibility (in metadata)
   metadata: Record<string, any>;
   created_at: Date;
   updated_at: Date;

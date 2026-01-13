@@ -11,44 +11,27 @@ const router = Router();
  */
 router.get('/status', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const configuredProvider = env.AI_AGENT_PROVIDER || 'elevenlabs';
-    const hasOpenAIKey = !!env.OPENAI_API_KEY;
+    const hasOpenAIKey = !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
     const isOpenRouter = env.OPENAI_API_KEY?.startsWith('sk-or-');
     const openAIModel = env.OPENAI_MODEL || 'gpt-4o-mini';
     const baseURL = env.OPENAI_BASE_URL || (isOpenRouter ? 'https://openrouter.ai/api/v1' : 'https://api.openai.com/v1');
 
-    // Determine actual provider that will be used
-    let actualProvider: string;
-    let actualProviderReason: string;
-    
-    if (configuredProvider === 'openai' && hasOpenAIKey) {
-      actualProvider = 'openai';
-      actualProviderReason = 'Configured and API key present';
-    } else if (configuredProvider === 'openai' && !hasOpenAIKey) {
-      actualProvider = 'elevenlabs';
-      actualProviderReason = 'OpenAI configured but no API key - will fallback to ElevenLabs';
-    } else {
-      actualProvider = 'elevenlabs';
-      actualProviderReason = 'Default provider or OpenAI not configured';
-    }
-
     res.json({
       success: true,
       data: {
-        configuredProvider,
-        actualProvider,
-        actualProviderReason,
+        provider: 'openai',
+        note: 'ElevenLabs agent removed - using OpenAI only (ElevenLabs TTS remains)',
         openai: {
-          configured: configuredProvider === 'openai',
           hasApiKey: hasOpenAIKey,
           apiKeyPrefix: env.OPENAI_API_KEY?.substring(0, 10) + '...' || 'none',
           isOpenRouter,
           model: openAIModel,
           baseURL,
+          status: hasOpenAIKey ? 'ready' : 'not_configured',
         },
         elevenlabs: {
           hasApiKey: !!env.ELEVENLABS_API_KEY,
-          willBeUsed: actualProvider === 'elevenlabs',
+          note: 'TTS only (agent removed)',
         },
       },
     });

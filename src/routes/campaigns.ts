@@ -11,66 +11,27 @@ import { logger } from '../utils/logger';
 import { isSuperAdmin, getUserCompanyId } from '../utils/companyAccess';
 import { env } from '../config/env';
 import { createWebhookToken, generateReplyToEmail, generateSMSWebhookUrl, generateEmailWebhookUrl, getOrCreateCampaignWebhookToken } from '../services/webhookTokens';
-import { updateKnowledgeBaseDocument } from '../services/elevenlabsKnowledgeBase';
+// DEPRECATED: ElevenLabs knowledge base removed (agent removed, only TTS remains)
+// import { updateKnowledgeBaseDocument } from '../services/elevenlabsKnowledgeBase';
 import { campaignQueue, calculateDelay, CampaignJobData } from '../services/campaignQueue';
 
 const router = Router();
 
 /**
  * Helper function to refresh knowledge base for a company after campaign changes
- * This is called asynchronously and errors are logged but don't fail the request
+ * DEPRECATED: This was for ElevenLabs agent knowledge base. Since we removed ElevenLabs agent,
+ * this function is disabled. OpenAI agent uses CRM context directly, no knowledge base needed.
  */
 async function refreshCompanyKnowledgeBase(accountId: string | null): Promise<void> {
-  if (!accountId) {
-    return;
-  }
-
-  try {
-    // Find the company's AI agent config
-    const agentConfig = await queryOne<{
-      id: string;
-      name: string;
-      kb_campaigns_document_id: string | null;
-    }>(
-      `SELECT id, name, kb_campaigns_document_id
-       FROM ai_agent_configurations
-       WHERE account_id = $1
-       AND is_active = true
-       AND kb_campaigns_document_id IS NOT NULL
-       LIMIT 1`,
-      [accountId]
-    );
-
-    if (!agentConfig || !agentConfig.kb_campaigns_document_id) {
-      // No active agent config with KB document configured
-      return;
-    }
-
-    // Update the campaigns knowledge base document with latest data
-    await updateKnowledgeBaseDocument({
-      documentationId: agentConfig.kb_campaigns_document_id,
-      companyId: accountId,
-      type: 'campaigns',
-      displayName: `${agentConfig.name} - Campaigns Knowledge Base`,
-    });
-
-    logger.info('[CAMPAIGN] Knowledge base refreshed after campaign change', {
-      accountId,
-      agentConfigId: agentConfig.id,
-    });
-  } catch (error: any) {
-    // Log error but don't fail the campaign operation
-    logger.warn('[CAMPAIGN] Failed to refresh knowledge base', {
-      accountId,
-      error: error.message,
-    });
-  }
+  // Disabled - ElevenLabs agent removed, OpenAI uses CRM context directly
+  // Keeping function for backward compatibility but it does nothing
+  return;
 }
 
 const channelConfigSchema = z.object({
   enabled: z.boolean(),
-  delay: z.number().min(0),
-  unit: z.enum(['minutes', 'hours', 'days']),
+  send_now: z.boolean().optional(), // If true, execute immediately
+  scheduled_time: z.string().optional().nullable(), // ISO date/time string in UTC (required if send_now is false)
 });
 
 const createCampaignSchema = z.object({
@@ -79,12 +40,15 @@ const createCampaignSchema = z.object({
   type: z.enum(['reactivation', 'marketing', 'survey']).optional(), // Deprecated, kept for backward compatibility
   channel: z.enum(['email', 'sms', 'call', 'multi']),
   status: z.enum(['draft', 'scheduled', 'running', 'paused', 'completed']).optional(),
+  instructions: z.string().optional().nullable(), // AI prompt for personalized content generation
+  custom_introduction: z.string().optional().nullable(), // Custom introduction/greeting text
+  use_custom_introduction: z.boolean().optional().default(false), // Toggle to use custom introduction
   start_date: z.string().optional().nullable(),
   end_date: z.string().optional().nullable(),
   metadata: z.object({
     contact_group_ids: z.array(z.string().uuid()).optional(), // Primary method: select by groups
     contact_ids: z.array(z.string().uuid()).optional(), // Deprecated: backward compatibility
-    template_id: z.string().uuid().optional(),
+    template_id: z.string().uuid().optional(), // Deprecated - kept for backward compatibility
     survey_id: z.string().uuid().optional(),
     days_inactive: z.number().optional(), // Optional: filter groups by dormancy
     channels: z.object({
@@ -361,8 +325,8 @@ router.post('/', authenticate, async (req: Request, res: Response, next: NextFun
     const userId = req.user?.userId;
     
     const result = await queryOne(
-      `INSERT INTO campaigns (name, description, type, channel, status, created_by, start_date, end_date, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO campaigns (name, description, type, channel, status, created_by, start_date, end_date, instructions, custom_introduction, use_custom_introduction, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         validatedData.name,
@@ -373,6 +337,9 @@ router.post('/', authenticate, async (req: Request, res: Response, next: NextFun
         userId || null,
         validatedData.start_date || null,
         validatedData.end_date || null,
+        validatedData.instructions || null,
+        validatedData.custom_introduction || null,
+        validatedData.use_custom_introduction || false,
         JSON.stringify(validatedData.metadata || {}),
       ]
     );
@@ -699,6 +666,7 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       type: string;
       channel: string;
       status: string;
+      instructions: string | null;
       metadata: string;
       created_by: string | null;
       end_date: Date | string | null;
@@ -734,7 +702,12 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       ? JSON.parse(campaign.metadata) 
       : campaign.metadata;
 
-    // Get template
+    // Check if campaign has instructions (required for AI-generated campaigns)
+    if (!campaign.instructions || !campaign.instructions.trim()) {
+      throw createError('Campaign instructions are required for execution', 400);
+    }
+
+    // Get template (for backward compatibility with old campaigns)
     let template: any = null;
     if (template_id) {
       template = await queryOne('SELECT * FROM templates WHERE id = $1', [template_id]);
@@ -748,19 +721,13 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       }
     }
 
-    // Check if survey is specified in metadata
-    
+    // Check if survey is specified in metadata (for backward compatibility)
     let survey: any = null;
     if (metadata?.survey_id) {
       survey = await queryOne('SELECT * FROM surveys WHERE id = $1 AND is_active = true', [metadata.survey_id]);
       if (!survey) {
         throw createError('Survey not found or not active', 404);
       }
-    }
-
-    // Template is required if no survey is specified
-    if (!template && !survey) {
-      throw createError('Either template or survey is required for campaign execution', 400);
     }
 
     // Get target contacts with company filtering
@@ -883,26 +850,58 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
 
     // Get channel configuration from metadata or use legacy channel field
     let channels: {
-      email?: { enabled: boolean; delay: number; unit: 'minutes' | 'hours' | 'days' };
-      sms?: { enabled: boolean; delay: number; unit: 'minutes' | 'hours' | 'days' };
-      call?: { enabled: boolean; delay: number; unit: 'minutes' | 'hours' | 'days' };
+      email?: { enabled: boolean; send_now?: boolean; scheduled_time?: string | null };
+      sms?: { enabled: boolean; send_now?: boolean; scheduled_time?: string | null };
+      call?: { enabled: boolean; send_now?: boolean; scheduled_time?: string | null };
     } = {};
 
     if (metadata?.channels) {
       channels = metadata.channels;
+      
+      // Backward compatibility: Convert old delay/unit format to scheduled_time if needed
+      const now = new Date();
+      for (const [channelName, channelConfig] of Object.entries(channels)) {
+        const config = channelConfig as any;
+        // If it has delay/unit but no scheduled_time, convert it
+        if (config.enabled && config.delay !== undefined && config.unit && !config.scheduled_time && !config.send_now) {
+          const delayMs = calculateDelay(config.delay, config.unit);
+          if (delayMs === 0) {
+            // Immediate execution
+            channels[channelName as 'email' | 'sms' | 'call'] = {
+              enabled: true,
+              send_now: true,
+            };
+          } else {
+            // Scheduled execution
+            const scheduledTime = new Date(now.getTime() + delayMs);
+            channels[channelName as 'email' | 'sms' | 'call'] = {
+              enabled: true,
+              send_now: false,
+              scheduled_time: scheduledTime.toISOString(),
+            };
+          }
+        } else if (config.enabled && !config.scheduled_time && config.send_now === undefined) {
+          // Old campaigns without scheduled_time or send_now default to send_now
+          channels[channelName as 'email' | 'sms' | 'call'] = {
+            enabled: true,
+            send_now: true,
+          };
+        }
+      }
     } else {
       // Backward compatibility: infer from channel field
+      // For old campaigns, default to send_now (immediate execution)
       const channel = campaign.channel;
       if (channel === 'email') {
-        channels = { email: { enabled: true, delay: 0, unit: 'minutes' } };
+        channels = { email: { enabled: true, send_now: true } };
       } else if (channel === 'sms') {
-        channels = { sms: { enabled: true, delay: 0, unit: 'minutes' } };
+        channels = { sms: { enabled: true, send_now: true } };
       } else if (channel === 'call') {
-        channels = { call: { enabled: true, delay: 0, unit: 'minutes' } };
+        channels = { call: { enabled: true, send_now: true } };
       } else if (channel === 'multi') {
         channels = {
-          email: { enabled: true, delay: 0, unit: 'minutes' },
-          sms: { enabled: true, delay: 60, unit: 'minutes' },
+          email: { enabled: true, send_now: true },
+          sms: { enabled: true, send_now: true },
         };
       }
     }
@@ -922,7 +921,7 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
       jobs: [] as string[],
     };
 
-    const campaignStartTime = new Date();
+    const now = new Date();
 
     // Collect all job promises first (parallel queuing)
     const jobPromises: Promise<any>[] = [];
@@ -955,9 +954,33 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
             continue;
           }
 
-          // Calculate delay in milliseconds
-          const delayMs = calculateDelay(channelConfig.delay, channelConfig.unit);
-          const scheduledTime = new Date(campaignStartTime.getTime() + delayMs);
+          // Calculate delay from absolute scheduled_time or send_now flag
+          const sendNow = channelConfig.send_now === true;
+          let delayMs = 0;
+          let scheduledTime: Date | null = null;
+
+          if (sendNow) {
+            // Immediate execution
+            delayMs = 0;
+          } else {
+            // Scheduled execution
+            const scheduledTimeStr = channelConfig.scheduled_time;
+            if (!scheduledTimeStr) {
+              results.failed++;
+              results.errors.push(`${contact.first_name} ${contact.last_name}: No scheduled time for ${channel} (and send_now is false)`);
+              continue;
+            }
+
+            scheduledTime = new Date(scheduledTimeStr);
+            if (isNaN(scheduledTime.getTime())) {
+              results.failed++;
+              results.errors.push(`${contact.first_name} ${contact.last_name}: Invalid scheduled time for ${channel}`);
+              continue;
+            }
+
+            // Calculate delay in milliseconds (difference between now and scheduled time)
+            delayMs = Math.max(0, scheduledTime.getTime() - now.getTime());
+          }
 
           // Create job data
           const jobData: CampaignJobData = {
@@ -992,7 +1015,9 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
               campaignId: campaign.id,
               contactId: contact.id,
               channel,
-              scheduledTime: scheduledTime.toISOString(),
+              sendNow: sendNow,
+              delayMs,
+              scheduledTime: sendNow ? 'immediate' : (scheduledTime ? scheduledTime.toISOString() : 'N/A'),
             });
             return job;
           }).catch((error: any) => {

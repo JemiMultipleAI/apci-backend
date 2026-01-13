@@ -1,16 +1,47 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate } from '../middleware/auth';
+import { authenticate, enrichUser } from '../middleware/auth';
 import { query, queryOne } from '../db/connection';
 import { createError } from '../middleware/errorHandler';
+import { getEffectiveCompanyId } from '../utils/companyAccess';
+import { logger } from '../utils/logger';
+import { withCache } from '../utils/cache';
 
 const router = Router();
 
 // GET /api/analytics/dashboard - Get dashboard analytics
-router.get('/dashboard', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/dashboard', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    console.log('🔵 [ANALYTICS] Dashboard endpoint called');
-    console.log('🔵 [ANALYTICS] Authenticated user:', req.user?.userId);
-    // Get key metrics
+    if (!req.user) {
+      return next(createError('Unauthorized', 401));
+    }
+
+    const { company_id } = req.query;
+    const effectiveCompanyId = await getEffectiveCompanyId(
+      req.user,
+      company_id as string | undefined,
+      req.userCompanyId
+    );
+
+    logger.info('[ANALYTICS] Dashboard endpoint called', {
+      userId: req.user.userId,
+      effectiveCompanyId: effectiveCompanyId || 'all (super_admin)',
+      requestId: req.requestId,
+    });
+
+    // Build cache key
+    const cacheKey = `analytics:dashboard:${effectiveCompanyId || 'all'}`;
+
+    // Use cache wrapper (5 minute TTL)
+    return res.json(await withCache(
+      cacheKey,
+      async () => {
+        // Build company filter clause
+        const companyFilter = effectiveCompanyId
+          ? 'AND account_id = $1'
+          : '';
+        const params = effectiveCompanyId ? [effectiveCompanyId] : [];
+
+    // Get key metrics with company filtering
     const [
       totalContacts,
       totalAccounts,
@@ -19,156 +50,251 @@ router.get('/dashboard', authenticate, async (req: Request, res: Response, next:
       totalRevenue,
       pipelineValue,
     ] = await Promise.all([
-      queryOne<{ count: string }>('SELECT COUNT(*) as count FROM contacts'),
-      queryOne<{ count: string }>('SELECT COUNT(*) as count FROM accounts'),
-      queryOne<{ count: string }>('SELECT COUNT(*) as count FROM deals'),
       queryOne<{ count: string }>(
-        "SELECT COUNT(*) as count FROM deals WHERE stage NOT IN ('closed_won', 'closed_lost')"
+        `SELECT COUNT(*) as count FROM contacts WHERE 1=1 ${companyFilter}`,
+        params
+      ),
+      queryOne<{ count: string }>(
+        `SELECT COUNT(*) as count FROM accounts WHERE 1=1 ${companyFilter}`,
+        params
+      ),
+      queryOne<{ count: string }>(
+        `SELECT COUNT(*) as count FROM deals d 
+         INNER JOIN accounts a ON d.account_id = a.id 
+         WHERE 1=1 ${companyFilter}`,
+        params
+      ),
+      queryOne<{ count: string }>(
+        `SELECT COUNT(*) as count FROM deals d 
+         INNER JOIN accounts a ON d.account_id = a.id 
+         WHERE d.stage NOT IN ('closed_won', 'closed_lost') ${companyFilter}`,
+        params
       ),
       queryOne<{ sum: string }>(
-        "SELECT COALESCE(SUM(value), 0) as sum FROM deals WHERE stage = 'closed_won'"
+        `SELECT COALESCE(SUM(d.value), 0) as sum 
+         FROM deals d 
+         INNER JOIN accounts a ON d.account_id = a.id 
+         WHERE d.stage = 'closed_won' ${companyFilter}`,
+        params
       ),
       queryOne<{ sum: string }>(
-        "SELECT COALESCE(SUM(value * probability / 100.0), 0) as sum FROM deals WHERE stage NOT IN ('closed_won', 'closed_lost')"
+        `SELECT COALESCE(SUM(d.value * d.probability / 100.0), 0) as sum 
+         FROM deals d 
+         INNER JOIN accounts a ON d.account_id = a.id 
+         WHERE d.stage NOT IN ('closed_won', 'closed_lost') ${companyFilter}`,
+        params
       ),
     ]);
 
-    // Get recent activities
+    // Get recent activities with company filtering
     const recentActivities = await query(
       `SELECT a.*, 
         u.first_name || ' ' || u.last_name as performed_by_name
        FROM activities a
        LEFT JOIN users u ON a.performed_by = u.id
+       WHERE 1=1 ${companyFilter}
        ORDER BY a.created_at DESC
-       LIMIT 10`
+       LIMIT 10`,
+      params
     );
 
-    // Get pipeline by stage
+    // Get pipeline by stage with company filtering
     const pipelineByStage = await query(
       `SELECT 
-        stage,
+        d.stage,
         COUNT(*) as count,
-        COALESCE(SUM(value), 0) as total_value
-       FROM deals
-       WHERE stage NOT IN ('closed_won', 'closed_lost')
-       GROUP BY stage
+        COALESCE(SUM(d.value), 0) as total_value
+       FROM deals d
+       INNER JOIN accounts a ON d.account_id = a.id
+       WHERE d.stage NOT IN ('closed_won', 'closed_lost') ${companyFilter}
+       GROUP BY d.stage
        ORDER BY 
-         CASE stage
+         CASE d.stage
            WHEN 'lead' THEN 1
            WHEN 'qualified' THEN 2
            WHEN 'proposal' THEN 3
            WHEN 'negotiation' THEN 4
-         END`
+         END`,
+      params
     );
 
-    res.json({
-      success: true,
-      data: {
-        metrics: {
-          totalContacts: parseInt(totalContacts?.count || '0', 10),
-          totalAccounts: parseInt(totalAccounts?.count || '0', 10),
-          totalDeals: parseInt(totalDeals?.count || '0', 10),
-          activeDeals: parseInt(activeDeals?.count || '0', 10),
-          totalRevenue: parseFloat(totalRevenue?.sum || '0'),
-          pipelineValue: parseFloat(pipelineValue?.sum || '0'),
-        },
-        pipelineByStage,
-        recentActivities,
+        return {
+          success: true,
+          data: {
+            metrics: {
+              totalContacts: parseInt(totalContacts?.count || '0', 10),
+              totalAccounts: parseInt(totalAccounts?.count || '0', 10),
+              totalDeals: parseInt(totalDeals?.count || '0', 10),
+              activeDeals: parseInt(activeDeals?.count || '0', 10),
+              totalRevenue: parseFloat(totalRevenue?.sum || '0'),
+              pipelineValue: parseFloat(pipelineValue?.sum || '0'),
+            },
+            pipelineByStage,
+            recentActivities,
+          },
+        };
       },
+      300 // 5 minute cache
+    ));
+  } catch (error: any) {
+    logger.error('[ANALYTICS] Dashboard error:', {
+      error: error.message,
+      requestId: req.requestId,
     });
-  } catch (error) {
     next(error);
   }
 });
 
 // GET /api/analytics/revenue - Get revenue analytics
-router.get('/revenue', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/revenue', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { period = '30' } = req.query;
+    if (!req.user) {
+      return next(createError('Unauthorized', 401));
+    }
+
+    const { period = '30', company_id } = req.query;
     const days = parseInt(period as string);
-
-    // Revenue over time
-    const revenueOverTime = await query(
-      `SELECT 
-        DATE(actual_close_date) as date,
-        COUNT(*) as deal_count,
-        COALESCE(SUM(value), 0) as revenue
-       FROM deals
-       WHERE stage = 'closed_won'
-         AND actual_close_date >= CURRENT_DATE - INTERVAL '${days} days'
-       GROUP BY DATE(actual_close_date)
-       ORDER BY date ASC`
+    const effectiveCompanyId = await getEffectiveCompanyId(
+      req.user,
+      company_id as string | undefined,
+      req.userCompanyId
     );
 
-    // Revenue by stage
-    const revenueByStage = await query(
-      `SELECT 
-        stage,
-        COUNT(*) as count,
-        COALESCE(SUM(value), 0) as total_value,
-        COALESCE(AVG(value), 0) as avg_value
-       FROM deals
-       GROUP BY stage
-       ORDER BY 
-         CASE stage
-           WHEN 'lead' THEN 1
-           WHEN 'qualified' THEN 2
-           WHEN 'proposal' THEN 3
-           WHEN 'negotiation' THEN 4
-           WHEN 'closed_won' THEN 5
-           WHEN 'closed_lost' THEN 6
-         END`
-    );
+    // Build cache key
+    const cacheKey = `analytics:revenue:${effectiveCompanyId || 'all'}:${days}`;
 
-    res.json({
-      success: true,
-      data: {
-        revenueOverTime,
-        revenueByStage,
+    // Use cache wrapper (10 minute TTL for revenue data)
+    return res.json(await withCache(
+      cacheKey,
+      async () => {
+        // Build company filter clause
+        const companyFilter = effectiveCompanyId
+          ? 'AND a.account_id = $1'
+          : '';
+        const params = effectiveCompanyId ? [effectiveCompanyId] : [];
+
+        // Revenue over time with company filtering
+        const revenueOverTime = await query(
+          `SELECT 
+            DATE(d.actual_close_date) as date,
+            COUNT(*) as deal_count,
+            COALESCE(SUM(d.value), 0) as revenue
+           FROM deals d
+           INNER JOIN accounts a ON d.account_id = a.id
+           WHERE d.stage = 'closed_won'
+             AND d.actual_close_date >= CURRENT_DATE - INTERVAL '${days} days'
+             ${companyFilter}
+           GROUP BY DATE(d.actual_close_date)
+           ORDER BY date ASC`,
+          params
+        );
+
+        // Revenue by stage with company filtering
+        const revenueByStage = await query(
+          `SELECT 
+            d.stage,
+            COUNT(*) as count,
+            COALESCE(SUM(d.value), 0) as total_value,
+            COALESCE(AVG(d.value), 0) as avg_value
+           FROM deals d
+           INNER JOIN accounts a ON d.account_id = a.id
+           WHERE 1=1 ${companyFilter}
+           GROUP BY d.stage
+           ORDER BY 
+             CASE d.stage
+               WHEN 'lead' THEN 1
+               WHEN 'qualified' THEN 2
+               WHEN 'proposal' THEN 3
+               WHEN 'negotiation' THEN 4
+               WHEN 'closed_won' THEN 5
+               WHEN 'closed_lost' THEN 6
+             END`,
+          params
+        );
+
+        return {
+          success: true,
+          data: {
+            revenueOverTime,
+            revenueByStage,
+          },
+        };
       },
-    });
+      600 // 10 minute cache
+    ));
   } catch (error) {
     next(error);
   }
 });
 
 // GET /api/analytics/contacts - Get contact analytics
-router.get('/contacts', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.get('/contacts', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Contacts by lifecycle stage
-    const byLifecycle = await query(
-      `SELECT 
-        lifecycle_stage,
-        COUNT(*) as count
-       FROM contacts
-       GROUP BY lifecycle_stage
-       ORDER BY 
-         CASE lifecycle_stage
-           WHEN 'lead' THEN 1
-           WHEN 'qualified' THEN 2
-           WHEN 'customer' THEN 3
-           WHEN 'churned' THEN 4
-         END`
+    if (!req.user) {
+      return next(createError('Unauthorized', 401));
+    }
+
+    const { company_id } = req.query;
+    const effectiveCompanyId = await getEffectiveCompanyId(
+      req.user,
+      company_id as string | undefined,
+      req.userCompanyId
     );
 
-    // Activity by type
-    const activityByType = await query(
-      `SELECT 
-        type,
-        COUNT(*) as count
-       FROM activities
-       WHERE created_at >= CURRENT_DATE - INTERVAL '30 days'
-       GROUP BY type
-       ORDER BY count DESC`
-    );
+    // Build cache key
+    const cacheKey = `analytics:contacts:${effectiveCompanyId || 'all'}`;
 
-    res.json({
-      success: true,
-      data: {
-        byLifecycle,
-        activityByType,
+    // Use cache wrapper (5 minute TTL)
+    return res.json(await withCache(
+      cacheKey,
+      async () => {
+        // Build company filter clause
+        const companyFilter = effectiveCompanyId
+          ? 'AND account_id = $1'
+          : '';
+        const params = effectiveCompanyId ? [effectiveCompanyId] : [];
+
+        // Contacts by lifecycle stage with company filtering
+        const byLifecycle = await query(
+          `SELECT 
+            lifecycle_stage,
+            COUNT(*) as count
+           FROM contacts
+           WHERE 1=1 ${companyFilter}
+           GROUP BY lifecycle_stage
+           ORDER BY 
+             CASE lifecycle_stage
+               WHEN 'lead' THEN 1
+               WHEN 'qualified' THEN 2
+               WHEN 'customer' THEN 3
+               WHEN 'churned' THEN 4
+             END`,
+          params
+        );
+
+        // Activity by type with company filtering
+        const activityByType = await query(
+          `SELECT 
+            type,
+            COUNT(*) as count
+           FROM activities
+           WHERE created_at >= CURRENT_DATE - INTERVAL '30 days'
+             ${companyFilter}
+           GROUP BY type
+           ORDER BY count DESC`,
+          params
+        );
+
+        return {
+          success: true,
+          data: {
+            byLifecycle,
+            activityByType,
+          },
+        };
       },
-    });
+      300 // 5 minute cache
+    ));
   } catch (error) {
     next(error);
   }
