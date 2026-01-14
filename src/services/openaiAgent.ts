@@ -222,13 +222,16 @@ async function buildSystemPrompt(
   contactId?: string,
   campaignInstructions?: string // Campaign instructions for context
 ): Promise<string> {
-  let prompt = `You are a helpful customer service assistant for a CRM platform. Your goal is to provide helpful, professional, and concise responses to customer inquiries.
+  let prompt = `You are a helpful CRM assistant for a CRM platform. You can help with:
+1. Answering questions about CRM data (campaigns, deals, contacts, etc.)
+2. Providing customer service support
+3. Assisting with CRM-related inquiries
 
 Guidelines:
 - Be friendly and professional
 - Keep responses concise (especially for SMS - under 160 characters when possible)
 - If you don't know something, admit it rather than guessing
-- Focus on being helpful and resolving the customer's issue
+- Focus on being helpful and resolving issues
 - When customers ask for "more information", "tell me more", or similar requests, proactively provide detailed information about the campaign, product, or service being discussed
 - Be informative and helpful - don't just ask what they want, provide useful details based on the context
 `;
@@ -244,12 +247,13 @@ Guidelines:
       const campaignsText = await getCampaignsKnowledgeBaseText(accountId);
       const dealsText = await getDealsKnowledgeBaseText(accountId);
 
+      // Add CRM data sections with explicit instructions
       if (campaignsText && campaignsText !== 'No active campaigns found.') {
-        prompt += `\n\nActive Campaigns:\n${campaignsText}\n`;
+        prompt += `\n\nActive Campaigns:\n${campaignsText}\n\nIMPORTANT: When users ask about campaigns (e.g., "what are the current active campaigns", "list campaigns", "show me campaigns"), use the information from the Active Campaigns section above to provide a detailed response. List the campaigns with their details.`;
       }
 
       if (dealsText && dealsText !== 'No open deals found.') {
-        prompt += `\n\nOpen Deals:\n${dealsText}\n`;
+        prompt += `\n\nOpen Deals:\n${dealsText}\n\nIMPORTANT: When users ask about deals (e.g., "what are the open deals", "list deals", "show me deals"), use the information from the Open Deals section above to provide a detailed response. List the deals with their details.`;
       }
     } catch (error: any) {
       logger.warn('[OPENAI] Failed to load knowledge base context', { error: error.message, accountId });

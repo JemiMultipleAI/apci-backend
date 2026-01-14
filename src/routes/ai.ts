@@ -5,6 +5,7 @@ import { createError } from '../middleware/errorHandler';
 import { env } from '../config/env';
 import { sendMessageToAgent } from '../services/agentService';
 import { randomUUID } from 'crypto';
+import { logger } from '../utils/logger';
 
 const router = Router();
 
@@ -137,6 +138,20 @@ router.post('/chat', authenticate, enrichUser, async (req: Request, res: Respons
 
     // Use provided accountId or user's company ID
     const effectiveAccountId = accountId || req.userCompanyId || null;
+    
+    // Log accountId availability for debugging
+    if (!effectiveAccountId) {
+      logger.warn('[AI_CHAT] No accountId available - CRM data will not be loaded', {
+        userId: req.user?.userId,
+        hasUserCompanyId: !!req.userCompanyId,
+        hasAccountId: !!accountId,
+      });
+    } else {
+      logger.debug('[AI_CHAT] Using accountId for CRM context', {
+        accountId: effectiveAccountId,
+        hasContactId: !!contactId,
+      });
+    }
 
     // Generate or use provided conversation ID
     let currentConversationId = conversationId;
