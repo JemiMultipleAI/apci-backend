@@ -31,6 +31,7 @@ interface VoiceCallBridge {
   aiSpeechEndTime?: number; // When AI finished speaking
   lastTranscriptText?: string; // Track last transcript to detect duplicates
   lastTranscriptTime?: number; // Track when last transcript was received
+  instructions?: string; // Campaign instructions for AI context
 }
 
 // Store active bridges
@@ -48,7 +49,8 @@ export async function startVoiceCallBridge(
   agentId: string,
   contactId?: string,
   accountId?: string,
-  customIntroduction?: string
+  customIntroduction?: string,
+  instructions?: string // Campaign instructions for AI context
 ): Promise<void> {
   const callSid = streamConnection.callSid;
   const voiceId = env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
@@ -117,6 +119,7 @@ export async function startVoiceCallBridge(
     isAISpeaking: false, // AI not speaking initially
     lastTranscriptText: undefined,
     lastTranscriptTime: undefined,
+    instructions, // Store campaign instructions for all messages
   };
 
   activeBridges.set(callSid, bridge);
@@ -151,17 +154,34 @@ export async function startVoiceCallBridge(
   // Send initial greeting/context message to the AI agent
   // This will trigger the AI to respond with a greeting so the caller hears something immediately
   if (ttsClient && env.OPENAI_API_KEY) {
-    // Use custom introduction if provided, otherwise use default greeting
-    const greetingMessage = customIntroduction && customIntroduction.trim()
-      ? customIntroduction.trim()
-      : 'The caller has just connected to the call. Please introduce yourself briefly and ask how you can help them today.';
+    // Build greeting message with campaign instructions if available
+    let greetingMessage: string;
+    
+    if (instructions && instructions.trim()) {
+      // If campaign instructions are provided, include them in the prompt
+      // Make it explicit: greet first, then discuss the campaign
+      if (customIntroduction && customIntroduction.trim()) {
+        greetingMessage = `${customIntroduction.trim()}\n\nYou are calling about a campaign. Please:\n1. Greet the caller warmly\n2. Then discuss the campaign based on these instructions:\n\n${instructions.trim()}\n\nStart the conversation now.`;
+      } else {
+        greetingMessage = `You are calling about a campaign. Please:\n1. Greet the caller warmly\n2. Then discuss the campaign based on these instructions:\n\n${instructions.trim()}\n\nStart the conversation now.`;
+      }
+    } else {
+      // Fallback to custom introduction or default greeting
+      greetingMessage = customIntroduction && customIntroduction.trim()
+        ? customIntroduction.trim()
+        : 'The caller has just connected to the call. Please introduce yourself briefly and ask how you can help them today.';
+    }
     
     logger.info('[VOICE_BRIDGE] Sending initial greeting to AI agent', { 
       callSid,
       hasTtsClient: !!ttsClient,
       hasOpenAIKey: !!env.OPENAI_API_KEY,
       hasCustomIntroduction: !!customIntroduction,
+      hasInstructions: !!instructions,
       greetingLength: greetingMessage.length,
+      note: instructions 
+        ? '✅ Campaign instructions included - AI will have full context like email/SMS'
+        : '⚠️ No campaign instructions - using generic greeting',
     });
     
     // Send initial greeting to trigger AI response
@@ -433,12 +453,15 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
 
     // Use unified agent service (OpenAI Chat API)
     // Pass accountId and contactId to get CRM context (same as SMS/Email)
+    // Pass campaign instructions for ongoing conversation context
     const response = await sendMessageToAgent(
       bridge.agentId,
       text,
       undefined,
       bridge.contactId,
-      bridge.accountId
+      bridge.accountId,
+      3,
+      bridge.instructions // Pass campaign instructions for all messages
     );
 
     // CRITICAL: Clear STT buffer again before starting TTS (extra safety)

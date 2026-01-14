@@ -159,13 +159,38 @@ export async function processInboundMessage(
       provider: 'openai',
     });
 
+    // Fetch campaign instructions if campaign_id is available
+    let campaignInstructions: string | undefined;
+    if (tokenData.campaign_id) {
+      try {
+        const campaign = await queryOne<{ instructions: string | null }>(
+          'SELECT instructions FROM campaigns WHERE id = $1',
+          [tokenData.campaign_id]
+        );
+        if (campaign?.instructions) {
+          campaignInstructions = campaign.instructions;
+          logger.debug('[INBOUND] Campaign instructions loaded', {
+            campaignId: tokenData.campaign_id,
+            instructionsLength: campaignInstructions.length,
+          });
+        }
+      } catch (error: any) {
+        logger.warn('[INBOUND] Failed to load campaign instructions', {
+          campaignId: tokenData.campaign_id,
+          error: error.message,
+        });
+      }
+    }
+
     const agentRequestStartTime = Date.now();
     const agentResponse = await sendMessageToAgent(
       agentConfig.agent_id,
       options.messageBody,
       agentConfig.id,
       contactId || undefined,
-      tokenData.account_id
+      tokenData.account_id,
+      3,
+      campaignInstructions // Pass campaign instructions for context
     );
     const agentResponseTime = Date.now() - agentRequestStartTime;
 
@@ -409,13 +434,38 @@ export async function processInboundMessageByContact(
       provider: process.env.AI_AGENT_PROVIDER || 'elevenlabs',
     });
 
+    // Fetch campaign instructions if campaign_id is available
+    let campaignInstructions: string | undefined;
+    if (options.campaignId) {
+      try {
+        const campaign = await queryOne<{ instructions: string | null }>(
+          'SELECT instructions FROM campaigns WHERE id = $1',
+          [options.campaignId]
+        );
+        if (campaign?.instructions) {
+          campaignInstructions = campaign.instructions;
+          logger.debug('[INBOUND] Campaign instructions loaded', {
+            campaignId: options.campaignId,
+            instructionsLength: campaignInstructions.length,
+          });
+        }
+      } catch (error: any) {
+        logger.warn('[INBOUND] Failed to load campaign instructions', {
+          campaignId: options.campaignId,
+          error: error.message,
+        });
+      }
+    }
+
     const agentRequestStartTime = Date.now();
     const agentResponse = await sendMessageToAgent(
       agentConfig.agent_id,
       options.messageBody,
       agentConfig.id,
       options.contactId,
-      options.accountId
+      options.accountId,
+      3,
+      campaignInstructions // Pass campaign instructions for context
     );
     const agentResponseTime = Date.now() - agentRequestStartTime;
 

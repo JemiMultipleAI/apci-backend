@@ -14,6 +14,7 @@ export interface VoiceCallOptions {
   accountId?: string; // Account ID for agent config lookup
   useAgent?: boolean; // Whether to use agent (Media Streams) or simple TTS
   customIntroduction?: string; // Custom introduction/greeting for agent calls
+  instructions?: string; // Campaign instructions for AI context
 }
 
 export interface VoiceCallResult {
@@ -179,6 +180,9 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
         }
         if (options.customIntroduction) {
           customParams.customIntroduction = options.customIntroduction;
+        }
+        if (options.instructions) {
+          customParams.instructions = options.instructions;
         }
 
         // Validate required parameters
@@ -406,7 +410,8 @@ export const makeVoiceCallFromTemplate = async (
   contactId?: string,
   accountId?: string,
   useAgent?: boolean,
-  customIntroduction?: string
+  customIntroduction?: string,
+  instructions?: string // Campaign instructions for AI context
 ): Promise<VoiceCallResult> => {
   const processedScript = script ? replaceTemplateVariables(script, variables) : undefined;
 
@@ -414,6 +419,7 @@ export const makeVoiceCallFromTemplate = async (
     to,
     script: processedScript,
     customIntroduction,
+    instructions,
     from,
     voiceId,
     agentId,

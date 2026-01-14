@@ -19,7 +19,8 @@ export async function sendMessageToAgent(
   agentConfigId?: string,
   contactId?: string,
   accountId?: string,
-  maxRetries: number = 3
+  maxRetries: number = 3,
+  campaignInstructions?: string // Campaign instructions for AI context
 ): Promise<AgentResponse> {
   const openAIKey = (env.OPENAI_API_KEY || '').trim();
   const hasOpenAIKey = openAIKey.length > 0;
@@ -50,7 +51,8 @@ export async function sendMessageToAgent(
       agentConfigId,
       contactId,
       accountId,
-      maxRetries
+      maxRetries,
+      campaignInstructions
     );
 
     if (response.success && response.response) {

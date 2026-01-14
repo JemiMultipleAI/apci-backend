@@ -473,7 +473,8 @@ campaignQueue.process('campaign-message', 1, async (job) => {
             contactId,
             effectiveAccountId || undefined, // Pass effectiveAccountId to voice call - ensures agent gets CRM context
             useAgent,
-            customIntroduction
+            customIntroduction,
+            campaign.instructions // Pass campaign instructions for AI context
           );
 
           logger.info('[CAMPAIGN_QUEUE] Voice call result', {

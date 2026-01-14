@@ -23,7 +23,8 @@ export async function sendMessageToOpenAI(
   agentConfigId?: string,
   contactId?: string,
   accountId?: string,
-  maxRetries: number = 3
+  maxRetries: number = 3,
+  campaignInstructions?: string // Campaign instructions for AI context
 ): Promise<AgentResponse> {
   const startTime = Date.now();
   let lastError: Error | null = null;
@@ -88,7 +89,7 @@ export async function sendMessageToOpenAI(
       });
 
       // Build context for the prompt
-      const systemPrompt = await buildSystemPrompt(accountId, contactId);
+      const systemPrompt = await buildSystemPrompt(accountId, contactId, campaignInstructions);
       const conversationHistory = await getConversationHistory(contactId, accountId);
 
       // Build messages array
@@ -216,7 +217,11 @@ export async function sendMessageToOpenAI(
 /**
  * Build system prompt with context about campaigns, deals, and company
  */
-async function buildSystemPrompt(accountId?: string, contactId?: string): Promise<string> {
+async function buildSystemPrompt(
+  accountId?: string, 
+  contactId?: string,
+  campaignInstructions?: string // Campaign instructions for context
+): Promise<string> {
   let prompt = `You are a helpful customer service assistant for a CRM platform. Your goal is to provide helpful, professional, and concise responses to customer inquiries.
 
 Guidelines:
@@ -224,7 +229,14 @@ Guidelines:
 - Keep responses concise (especially for SMS - under 160 characters when possible)
 - If you don't know something, admit it rather than guessing
 - Focus on being helpful and resolving the customer's issue
+- When customers ask for "more information", "tell me more", or similar requests, proactively provide detailed information about the campaign, product, or service being discussed
+- Be informative and helpful - don't just ask what they want, provide useful details based on the context
 `;
+
+  // Include campaign instructions if provided (for ongoing conversations)
+  if (campaignInstructions && campaignInstructions.trim()) {
+    prompt += `\n\nCampaign Instructions:\n${campaignInstructions.trim()}\n\nIMPORTANT: When customers ask for more information or details, use these campaign instructions to provide comprehensive, helpful responses. Don't just ask what they want - proactively share relevant information from the campaign instructions.`;
+  }
 
   // Add knowledge base context if accountId is available
   if (accountId) {
@@ -285,7 +297,7 @@ async function getConversationHistory(
   }
 
   try {
-    // Get conversation history (try both email and SMS channels)
+    // Get conversation history from ALL channels (email, SMS, and call)
     const emailConversation = await Conversation.findOne({
       contact_id: contactId,
       account_id: accountId,
@@ -298,13 +310,20 @@ async function getConversationHistory(
       channel: 'sms',
     }).sort({ updated_at: -1 });
 
-    // Use the most recently updated conversation, or combine both
-    const conversations = [emailConversation, smsConversation].filter(Boolean);
+    // Include call channel history
+    const callConversation = await Conversation.findOne({
+      contact_id: contactId,
+      account_id: accountId,
+      channel: 'call',
+    }).sort({ updated_at: -1 });
+
+    // Use the most recently updated conversation, or combine all
+    const conversations = [emailConversation, smsConversation, callConversation].filter(Boolean);
     if (conversations.length === 0) {
       return [];
     }
 
-    // Merge messages from both channels, sort by timestamp
+    // Merge messages from all channels, sort by timestamp
     const allMessages = conversations.flatMap(conv => conv?.messages || []);
     allMessages.sort((a, b) => (a.timestamp?.getTime() || 0) - (b.timestamp?.getTime() || 0));
 

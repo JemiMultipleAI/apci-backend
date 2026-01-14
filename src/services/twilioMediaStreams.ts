@@ -160,6 +160,7 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
               const contactId = startCustomParams.contact_id;
               const accountId = startCustomParams.account_id;
               const customIntroduction = startCustomParams.customIntroduction;
+              const instructions = startCustomParams.instructions;
               
               logger.info('[MEDIA_STREAM] Extracted custom parameters', {
                 callSid: message.start.callSid,
@@ -167,6 +168,7 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
                 contactId: contactId || 'MISSING',
                 accountId: accountId || 'MISSING',
                 hasCustomIntroduction: !!customIntroduction,
+                hasInstructions: !!instructions,
               });
               
               if (agentId) {
@@ -177,7 +179,8 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
                     agentId,
                     contactId,
                     accountId,
-                    customIntroduction
+                    customIntroduction,
+                    instructions
                   ).catch((error: any) => {
                     logger.error('[MEDIA_STREAM] Failed to start bridge', {
                       callSid: connection!.callSid,
