@@ -1,10 +1,29 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate } from '../middleware/auth';
+import { authenticate, enrichUser } from '../middleware/auth';
 import { analyzeSentiment, predictChurn, getNextBestAction } from '../services/ai';
 import { createError } from '../middleware/errorHandler';
 import { env } from '../config/env';
+import { sendMessageToAgent } from '../services/agentService';
+import { randomUUID } from 'crypto';
 
 const router = Router();
+
+// In-memory conversation storage for chatbot testing
+// Key: conversationId, Value: Array of messages { role: 'user' | 'assistant', content: string, timestamp: Date }
+const conversationHistory = new Map<string, Array<{ role: 'user' | 'assistant'; content: string; timestamp: Date }>>();
+
+// Clean up old conversations (older than 1 hour) periodically
+setInterval(() => {
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  for (const [conversationId, messages] of conversationHistory.entries()) {
+    if (messages.length > 0) {
+      const lastMessage = messages[messages.length - 1];
+      if (lastMessage.timestamp.getTime() < oneHourAgo) {
+        conversationHistory.delete(conversationId);
+      }
+    }
+  }
+}, 15 * 60 * 1000); // Run every 15 minutes
 
 // GET /api/ai/status - Check AI provider configuration and status
 router.get('/status', authenticate, async (req: Request, res: Response, next: NextFunction) => {
@@ -102,6 +121,130 @@ router.get('/next-action/:contactId', authenticate, async (req: Request, res: Re
       },
     });
   } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/ai/chat - Chat with the AI agent for testing
+// Allows testing conversations with optional CRM context (contactId/accountId)
+router.post('/chat', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { message, conversationId, contactId, accountId, clearHistory } = req.body;
+
+    if (!message || typeof message !== 'string') {
+      throw createError('Message is required', 400);
+    }
+
+    // Use provided accountId or user's company ID
+    const effectiveAccountId = accountId || req.userCompanyId || null;
+
+    // Generate or use provided conversation ID
+    let currentConversationId = conversationId;
+    if (!currentConversationId || clearHistory) {
+      currentConversationId = randomUUID();
+    }
+
+    // Get or create conversation history
+    let messages = conversationHistory.get(currentConversationId) || [];
+
+    // Clear history if requested
+    if (clearHistory) {
+      messages = [];
+    }
+
+    // Add user message to history
+    const userMessage = {
+      role: 'user' as const,
+      content: message,
+      timestamp: new Date(),
+    };
+    messages.push(userMessage);
+
+    // Use a placeholder agent ID for testing
+    const agentId = 'chatbot-test-agent';
+
+    // Send message to agent with optional CRM context
+    const agentResponse = await sendMessageToAgent(
+      agentId,
+      message,
+      undefined, // agentConfigId
+      contactId || undefined,
+      effectiveAccountId || undefined
+    );
+
+    if (!agentResponse.success || !agentResponse.response) {
+      // Remove user message from history if agent failed
+      messages.pop();
+      
+      return res.status(500).json({
+        success: false,
+        error: agentResponse.error || 'Failed to get response from AI agent',
+        conversationId: currentConversationId,
+      });
+    }
+
+    // Add assistant response to history
+    const assistantMessage = {
+      role: 'assistant' as const,
+      content: agentResponse.response,
+      timestamp: new Date(),
+    };
+    messages.push(assistantMessage);
+
+    // Keep only last 20 messages to prevent memory issues
+    if (messages.length > 20) {
+      messages = messages.slice(-20);
+    }
+
+    // Store updated conversation history
+    conversationHistory.set(currentConversationId, messages);
+
+    res.json({
+      success: true,
+      data: {
+        conversationId: currentConversationId,
+        message: agentResponse.response,
+        responseTimeMs: agentResponse.responseTimeMs,
+        hasContactContext: !!contactId,
+        hasAccountContext: !!effectiveAccountId,
+        messageCount: messages.length,
+      },
+    });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// GET /api/ai/chat/:conversationId - Get conversation history
+router.get('/chat/:conversationId', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { conversationId } = req.params;
+    const messages = conversationHistory.get(conversationId) || [];
+
+    res.json({
+      success: true,
+      data: {
+        conversationId,
+        messages,
+        messageCount: messages.length,
+      },
+    });
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// DELETE /api/ai/chat/:conversationId - Clear conversation history
+router.delete('/chat/:conversationId', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { conversationId } = req.params;
+    conversationHistory.delete(conversationId);
+
+    res.json({
+      success: true,
+      message: 'Conversation history cleared',
+    });
+  } catch (error: any) {
     next(error);
   }
 });
