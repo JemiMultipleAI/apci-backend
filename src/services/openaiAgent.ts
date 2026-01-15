@@ -222,9 +222,10 @@ async function buildSystemPrompt(
   contactId?: string,
   campaignInstructions?: string // Campaign instructions for context
 ): Promise<string> {
-  let prompt = `You are a helpful customer service assistant for a CRM platform. Your goal is to provide helpful, professional, and concise responses to customer inquiries.
+  let prompt = `You are Alice, a helpful customer service assistant for a CRM platform. Your goal is to provide helpful, professional, and concise responses to customer inquiries.
 
 Guidelines:
+- Your name is Alice - always introduce yourself as Alice
 - Be friendly and professional
 - Keep responses concise (especially for SMS - under 160 characters when possible)
 - If you don't know something, admit it rather than guessing
@@ -233,6 +234,37 @@ Guidelines:
 - Be informative and helpful - don't just ask what they want, provide useful details based on the context
 `;
 
+  // Add company/account information if available
+  let companyName: string | null = null;
+  if (accountId) {
+    try {
+      const account = await queryOne<{ name: string }>(
+        'SELECT name FROM accounts WHERE id = $1',
+        [accountId]
+      );
+      if (account?.name) {
+        companyName = account.name;
+        prompt += `\n\nCompany Information:\n- Company Name: ${companyName}\n`;
+        logger.debug('[OPENAI] Company information loaded', {
+          accountId,
+          companyName,
+        });
+      }
+    } catch (error: any) {
+      logger.warn('[OPENAI] Failed to load company information', {
+        error: error.message,
+        accountId,
+      });
+    }
+  }
+
+  // Add instructions for proper introductions
+  if (companyName) {
+    prompt += `\n\nIMPORTANT - When introducing yourself:\n- Your name is Alice\n- Use the actual company name "${companyName}" when introducing yourself\n- Do NOT use placeholder text like "Your Company" or "Your Name"\n- Simply say you're Alice calling from ${companyName} or representing ${companyName}\n- Be natural and conversational - don't use template-like phrases\n`;
+  } else {
+    prompt += `\n\nIMPORTANT - When introducing yourself:\n- Your name is Alice\n- Do NOT use placeholder text like "Your Company" or "Your Name"\n- Simply introduce yourself as Alice naturally without mentioning a specific company name\n- Be natural and conversational - don't use template-like phrases\n`;
+  }
+
   // Include campaign instructions if provided (for ongoing conversations)
   if (campaignInstructions && campaignInstructions.trim()) {
     prompt += `\n\nCampaign Instructions:\n${campaignInstructions.trim()}\n\nIMPORTANT: When customers ask for more information or details, use these campaign instructions to provide comprehensive, helpful responses. Don't just ask what they want - proactively share relevant information from the campaign instructions.`;
@@ -240,24 +272,47 @@ Guidelines:
 
   // Add knowledge base context if accountId is available
   if (accountId) {
+    logger.info('[OPENAI] Loading knowledge base context', { accountId });
     try {
       const campaignsText = await getCampaignsKnowledgeBaseText(accountId);
       const dealsText = await getDealsKnowledgeBaseText(accountId);
 
+      logger.info('[OPENAI] Knowledge base loaded', {
+        accountId,
+        hasCampaigns: campaignsText && campaignsText !== 'No active campaigns found.',
+        hasDeals: dealsText && dealsText !== 'No open deals found.',
+        campaignsTextLength: campaignsText?.length || 0,
+        dealsTextLength: dealsText?.length || 0,
+      });
+
       if (campaignsText && campaignsText !== 'No active campaigns found.') {
         prompt += `\n\nActive Campaigns:\n${campaignsText}\n`;
+      } else {
+        logger.debug('[OPENAI] No active campaigns found', { accountId });
       }
 
       if (dealsText && dealsText !== 'No open deals found.') {
         prompt += `\n\nOpen Deals:\n${dealsText}\n`;
+      } else {
+        logger.debug('[OPENAI] No open deals found', { accountId });
       }
     } catch (error: any) {
-      logger.warn('[OPENAI] Failed to load knowledge base context', { error: error.message, accountId });
+      logger.error('[OPENAI] Failed to load knowledge base context', { 
+        error: error.message,
+        stack: error.stack,
+        accountId 
+      });
     }
+  } else {
+    logger.warn('[OPENAI] No accountId provided - skipping knowledge base context', {
+      accountId,
+      contactId,
+    });
   }
 
   // Add contact context if contactId is available
   if (contactId && accountId) {
+    logger.info('[OPENAI] Loading contact context', { contactId, accountId });
     try {
       const contact = await queryOne<{
         first_name: string | null;
@@ -276,11 +331,34 @@ Guidelines:
         const name = [contact.first_name, contact.last_name].filter(Boolean).join(' ') || 'Customer';
         const lifecycle = contact.lifecycle_stage || 'unknown';
         prompt += `\n\nCustomer Context:\n- Name: ${name}\n- Lifecycle Stage: ${lifecycle}\n`;
+        logger.info('[OPENAI] Contact context loaded', {
+          contactId,
+          name,
+          lifecycle,
+        });
+      } else {
+        logger.warn('[OPENAI] Contact not found', { contactId, accountId });
       }
     } catch (error: any) {
-      logger.warn('[OPENAI] Failed to load contact context', { error: error.message, contactId });
+      logger.error('[OPENAI] Failed to load contact context', { 
+        error: error.message,
+        stack: error.stack,
+        contactId 
+      });
     }
+  } else {
+    logger.warn('[OPENAI] Missing contactId or accountId - skipping contact context', {
+      contactId,
+      accountId,
+    });
   }
+
+  logger.debug('[OPENAI] System prompt built', {
+    promptLength: prompt.length,
+    hasAccountId: !!accountId,
+    hasContactId: !!contactId,
+    hasCampaignInstructions: !!campaignInstructions,
+  });
 
   return prompt;
 }

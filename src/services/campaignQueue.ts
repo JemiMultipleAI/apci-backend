@@ -144,28 +144,59 @@ campaignQueue.process('campaign-message', 1, async (job) => {
       throw new Error(`Contact ${contactId} not found`);
     }
 
-    // Get campaign
+    // Get campaign with created_by to get user's account_id
     const campaign = await queryOne<{
       id: string;
       name: string;
       instructions?: string | null;
       custom_introduction?: string | null;
       use_custom_introduction?: boolean;
+      created_by?: string | null;
       [key: string]: any;
     }>('SELECT * FROM campaigns WHERE id = $1', [campaignId]);
     if (!campaign) {
       throw new Error(`Campaign ${campaignId} not found`);
     }
 
-    // CRITICAL: Ensure accountId is available - get from contact if not provided in job data
-    // This ensures the agent gets CRM context (campaigns, deals, contact info) for all channels
-    const effectiveAccountId = accountId || contact.account_id || null;
+    // CRITICAL: Ensure accountId is available - try multiple sources
+    // 1. From job data (accountId parameter)
+    // 2. From contact.account_id
+    // 3. From campaign creator's account_id (if contact doesn't have one)
+    let effectiveAccountId = accountId || contact.account_id || null;
+
+    if (!effectiveAccountId && campaign.created_by) {
+      try {
+        const creator = await queryOne<{ account_id: string | null }>(
+          'SELECT account_id FROM users WHERE id = $1',
+          [campaign.created_by]
+        );
+        if (creator?.account_id) {
+          effectiveAccountId = creator.account_id;
+          logger.info('[CAMPAIGN_QUEUE] Using accountId from campaign creator', {
+            accountId: effectiveAccountId,
+            campaignId,
+            contactId,
+            channel,
+            note: 'Contact and job data had no accountId, retrieved from campaign creator',
+          });
+        }
+      } catch (error: any) {
+        logger.warn('[CAMPAIGN_QUEUE] Failed to get accountId from campaign creator', {
+          error: error.message,
+          campaignId,
+          createdBy: campaign.created_by,
+        });
+      }
+    }
+
     if (!effectiveAccountId) {
       logger.warn('[CAMPAIGN_QUEUE] No accountId available - agent will not have CRM context', {
         campaignId,
         contactId,
         channel,
-        note: 'Contact has no account_id and job data has no accountId - agent responses will be generic',
+        contactHasAccountId: !!contact.account_id,
+        campaignCreatedBy: campaign.created_by || 'none',
+        note: 'Contact has no account_id, job data has no accountId, and campaign creator lookup failed - agent responses will be generic',
       });
     } else if (!accountId && contact.account_id) {
       logger.info('[CAMPAIGN_QUEUE] Using accountId from contact', {

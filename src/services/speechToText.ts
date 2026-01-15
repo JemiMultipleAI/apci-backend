@@ -255,6 +255,8 @@ function createOpenAIStream(
           model: 'whisper-1',
           language: language.split('-')[0], // Convert en-US to en
           response_format: 'verbose_json',
+          temperature: 0.0, // Lower temperature = more consistent, less creative (better for accuracy)
+          prompt: 'This is a customer service phone call. Common words: yes, no, okay, sure, thank you, campaign, information, details, tell me more, hello, hi, bye, goodbye. The caller may ask about campaigns, deals, or account information. The assistant is named Alice.', // Provide context for better accuracy
         });
 
         const transcriptText = transcript.text ? transcript.text.trim() : '';

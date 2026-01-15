@@ -159,11 +159,11 @@ export async function startVoiceCallBridge(
     
     if (instructions && instructions.trim()) {
       // If campaign instructions are provided, include them in the prompt
-      // Make it explicit: greet first, then discuss the campaign
+      // Make it explicit: greet first, ask for time, then discuss the campaign
       if (customIntroduction && customIntroduction.trim()) {
-        greetingMessage = `${customIntroduction.trim()}\n\nYou are calling about a campaign. Please:\n1. Greet the caller warmly\n2. Then discuss the campaign based on these instructions:\n\n${instructions.trim()}\n\nStart the conversation now.`;
+        greetingMessage = `${customIntroduction.trim()}\n\nYou are calling about a campaign. Please follow this flow:\n1. Greet the caller warmly and introduce yourself\n2. Ask if they have a moment to spare or if now is a good time to talk\n3. Once they confirm, discuss the campaign based on these instructions:\n\n${instructions.trim()}\n\nStart the conversation now.`;
       } else {
-        greetingMessage = `You are calling about a campaign. Please:\n1. Greet the caller warmly\n2. Then discuss the campaign based on these instructions:\n\n${instructions.trim()}\n\nStart the conversation now.`;
+        greetingMessage = `You are calling about a campaign. Please follow this flow:\n1. Greet the caller warmly and introduce yourself\n2. Ask if they have a moment to spare or if now is a good time to talk\n3. Once they confirm, discuss the campaign based on these instructions:\n\n${instructions.trim()}\n\nStart the conversation now.`;
       }
     } else {
       // Fallback to custom introduction or default greeting
@@ -712,6 +712,14 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
         if (currentBridge && currentBridge.isAISpeaking) {
           currentBridge.isAISpeaking = false;
           currentBridge.aiSpeechEndTime = Date.now();
+          
+          // CRITICAL: Clear STT buffer when AI finishes speaking to prevent processing residual audio
+          // This ensures no echo or mixed audio from AI speech interferes with user's next input
+          // This helps prevent mishearing user input (e.g., "yes" being transcribed as "Thank you")
+          if (currentBridge.sttStream && typeof currentBridge.sttStream.clear === 'function') {
+            currentBridge.sttStream.clear();
+            logger.debug('[VOICE_BRIDGE] Cleared STT buffer - AI finished speaking, ready for user input', { callSid });
+          }
           
           // Post-speech delay: additional buffer after audio finishes to allow echo to settle
           // This prevents immediate transcription of echo/crosstalk after AI finishes speaking
