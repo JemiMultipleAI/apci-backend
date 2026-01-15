@@ -9,7 +9,8 @@ import { logger } from '../utils/logger';
 
 interface ContactQueryResult {
   id: string;
-  account_id: string | null;
+  tenant_id: string | null; // For multi-tenant isolation
+  customer_company_id: string | null; // Updated: account_id renamed to customer_company_id
   first_name: string;
   last_name: string;
   email: string | null;
@@ -20,6 +21,7 @@ interface ContactQueryResult {
   lifecycle_stage: string;
   notes: string | null;
   custom_fields: Record<string, any>;
+  tags: string[]; // JSONB array
   created_at: Date;
   updated_at: Date;
 }
@@ -66,7 +68,7 @@ const normalizeMobile = (mobile: string | null | undefined): string | null => {
 
 // Validation schemas
 const createContactSchema = z.object({
-  account_id: z.string().uuid().optional().nullable(),
+  customer_company_id: z.string().uuid().optional().nullable(), // Updated: account_id → customer_company_id
   first_name: z.string().min(1),
   last_name: z.string().min(1),
   email: z.string().email().optional().nullable(),
@@ -88,6 +90,7 @@ const createContactSchema = z.object({
   owner_id: z.string().uuid().optional().nullable(),
   lifecycle_stage: z.enum(['lead', 'qualified', 'customer', 'churned']).optional(),
   notes: z.string().optional().nullable(),
+  tags: z.array(z.string()).optional(), // Tags for contact segmentation
 });
 
 // GET /api/contacts - List all contacts
@@ -100,7 +103,8 @@ router.get('/', authenticate, enrichUser, applyCompanyFilter(), async (req: Requ
     const { 
       page = '1', 
       limit = '10', 
-      account_id, 
+      customer_company_id, // Updated: account_id → customer_company_id
+      account_id, // Backward compatibility - maps to customer_company_id
       lifecycle_stage,
       lifecycle_stages,
       date_from,
@@ -121,11 +125,13 @@ router.get('/', authenticate, enrichUser, applyCompanyFilter(), async (req: Requ
       paramIndex = req.companyFilter.paramIndex + 1;
     }
 
-    if (account_id) {
-      const accountIdStr = Array.isArray(account_id) ? account_id[0] : account_id;
-      if (typeof accountIdStr === 'string') {
-        whereClause += ` AND account_id = $${paramIndex}`;
-        params.push(accountIdStr);
+    // Support both customer_company_id (new) and account_id (backward compatibility)
+    const customerCompanyId = customer_company_id || account_id;
+    if (customerCompanyId) {
+      const customerCompanyIdStr = Array.isArray(customerCompanyId) ? customerCompanyId[0] : customerCompanyId;
+      if (typeof customerCompanyIdStr === 'string') {
+        whereClause += ` AND customer_company_id = $${paramIndex}`;
+        params.push(customerCompanyIdStr);
         paramIndex++;
       }
     }
@@ -231,13 +237,11 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       throw createError('Contact not found', 404);
     }
 
-    // Check company access if contact has an account_id
-    if (contact.account_id) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (!isSuperAdmin(req.user) && userCompanyId !== contact.account_id) {
-        logger.warn('Contact access denied', { userId: req.user.userId, contactId: id, contactAccountId: contact.account_id, userCompanyId });
-        throw createError('Forbidden: You do not have access to this contact', 403);
-      }
+    // Check tenant access (multi-tenant isolation)
+    const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+    if (!isSuperAdmin(req.user) && userTenantId && contact.tenant_id !== userTenantId) {
+      logger.warn('Contact access denied', { userId: req.user.userId, contactId: id, contactTenantId: contact.tenant_id, userTenantId });
+      throw createError('Forbidden: You do not have access to this contact', 403);
     }
 
     res.json({
@@ -254,43 +258,38 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
   try {
     const validatedData = createContactSchema.parse(req.body);
     
-    // Determine account_id: use provided value, or auto-assign user's company for non-super_admin users
-    let accountId: string | null = validatedData.account_id || null;
+    // Determine tenant_id and customer_company_id
+    const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user!);
+    let tenantId: string | null = null;
+    let customerCompanyId: string | null = validatedData.customer_company_id || null;
     
-    // Validate UUID format for account_id if provided
-    if (accountId) {
+    // Validate UUID format for customer_company_id if provided
+    if (customerCompanyId) {
       const uuidSchema = z.string().uuid();
-      if (!uuidSchema.safeParse(accountId).success) {
-        throw createError('Invalid company ID format', 400);
+      if (!uuidSchema.safeParse(customerCompanyId).success) {
+        throw createError('Invalid customer company ID format', 400);
       }
-      
-      // Check company access if account_id is provided
-      if (!isSuperAdmin(req.user!)) {
-        const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user!);
-        if (userCompanyId !== accountId) {
-          logger.warn('Contact creation denied: Invalid company', { userId: req.user!.userId, requestedCompanyId: accountId, userCompanyId });
-          throw createError('Forbidden: You can only create contacts for your own company', 403);
-        }
-      }
-    } else {
-      // Auto-assign company if not provided and user is not super_admin
-      if (!isSuperAdmin(req.user!)) {
-        const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user!);
-        if (userCompanyId) {
-          accountId = userCompanyId;
-          logger.debug('Auto-assigning contact to user company', { userId: req.user!.userId, companyId: userCompanyId });
-        }
+    }
+    
+    // Auto-assign tenant_id for non-super_admin users
+    if (!isSuperAdmin(req.user!)) {
+      if (userTenantId) {
+        tenantId = userTenantId;
+        logger.debug('Auto-assigning contact to user tenant', { userId: req.user!.userId, tenantId: userTenantId });
+      } else {
+        throw createError('Cannot create contact: User does not belong to a tenant', 403);
       }
     }
     
     const result = await queryOne<ContactQueryResult>(
       `INSERT INTO contacts (
-        account_id, first_name, last_name, email, mobile,
-        job_title, department, owner_id, lifecycle_stage, notes
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        tenant_id, customer_company_id, first_name, last_name, email, mobile,
+        job_title, department, owner_id, lifecycle_stage, notes, tags
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       RETURNING *`,
       [
-        accountId,
+        tenantId,
+        customerCompanyId,
         validatedData.first_name,
         validatedData.last_name,
         validatedData.email || null,
@@ -300,6 +299,7 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
         validatedData.owner_id || null,
         validatedData.lifecycle_stage || 'lead',
         validatedData.notes || null,
+        JSON.stringify(validatedData.tags || []),
       ]
     );
 

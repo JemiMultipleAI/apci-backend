@@ -10,7 +10,8 @@ import { logger } from '../utils/logger';
 interface DealQueryResult {
   id: string;
   name: string;
-  account_id: string | null;
+  tenant_id: string | null; // For multi-tenant isolation
+  customer_company_id: string | null; // Updated: account_id → customer_company_id
   contact_id: string | null;
   owner_id: string | null;
   stage: string;
@@ -28,7 +29,7 @@ const router = Router();
 
 const createDealSchema = z.object({
   name: z.string().min(1),
-  account_id: z.string().uuid().optional().nullable(),
+  customer_company_id: z.string().uuid().optional().nullable(), // Updated: account_id → customer_company_id
   contact_id: z.string().uuid().optional().nullable(),
   owner_id: z.string().uuid().optional().nullable(),
   stage: z.enum(['lead', 'qualified', 'proposal', 'negotiation', 'closed_won', 'closed_lost']).optional(),
@@ -46,7 +47,7 @@ router.get('/', authenticate, enrichUser, applyCompanyFilter('d'), async (req: R
       return next(createError('Unauthorized', 401));
     }
 
-    const { page = '1', limit = '10', stage, owner_id, account_id } = req.query;
+    const { page = '1', limit = '10', stage, owner_id, customer_company_id, account_id } = req.query; // Support both for backward compat
     const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
     
     let whereClause = 'WHERE 1=1';
@@ -78,21 +79,23 @@ router.get('/', authenticate, enrichUser, applyCompanyFilter('d'), async (req: R
       }
     }
 
-    if (account_id) {
-      const accountIdStr = Array.isArray(account_id) ? account_id[0] : account_id;
-      if (typeof accountIdStr === 'string') {
-        whereClause += ` AND account_id = $${paramIndex}`;
-        params.push(accountIdStr);
+    // Support both customer_company_id (new) and account_id (backward compatibility)
+    const customerCompanyId = customer_company_id || account_id;
+    if (customerCompanyId) {
+      const customerCompanyIdStr = Array.isArray(customerCompanyId) ? customerCompanyId[0] : customerCompanyId;
+      if (typeof customerCompanyIdStr === 'string') {
+        whereClause += ` AND customer_company_id = $${paramIndex}`;
+        params.push(customerCompanyIdStr);
         paramIndex++;
       }
     }
 
     const deals = await query<DealQueryResult & { account_name: string | null; contact_name: string | null }>(
       `SELECT d.*, 
-        a.name as account_name,
+        cc.name as account_name,
         c.first_name || ' ' || c.last_name as contact_name
        FROM deals d
-       LEFT JOIN accounts a ON d.account_id = a.id
+       LEFT JOIN customer_companies cc ON d.customer_company_id = cc.id
        LEFT JOIN contacts c ON d.contact_id = c.id
        ${whereClause} 
        ORDER BY d.created_at DESC 
@@ -194,10 +197,10 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
     
     const deal = await queryOne<DealQueryResult & { account_name: string | null; contact_name: string | null }>(
       `SELECT d.*, 
-        a.name as account_name,
+        cc.name as account_name,
         c.first_name || ' ' || c.last_name as contact_name
        FROM deals d
-       LEFT JOIN accounts a ON d.account_id = a.id
+       LEFT JOIN customer_companies cc ON d.customer_company_id = cc.id
        LEFT JOIN contacts c ON d.contact_id = c.id
        WHERE d.id = $1`,
       [id]
@@ -207,13 +210,11 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       throw createError('Deal not found', 404);
     }
 
-    // Check company access if deal has an account_id
-    if (deal.account_id) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (!isSuperAdmin(req.user) && userCompanyId !== deal.account_id) {
-        logger.warn('Deal access denied', { userId: req.user.userId, dealId: id, dealAccountId: deal.account_id, userCompanyId });
-        throw createError('Forbidden: You do not have access to this deal', 403);
-      }
+    // Check tenant access (multi-tenant isolation)
+    const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+    if (!isSuperAdmin(req.user) && userTenantId && deal.tenant_id !== userTenantId) {
+      logger.warn('Deal access denied', { userId: req.user.userId, dealId: id, dealTenantId: deal.tenant_id, userTenantId });
+      throw createError('Forbidden: You do not have access to this deal', 403);
     }
 
     res.json({
@@ -230,32 +231,30 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
   try {
     const validatedData = createDealSchema.parse(req.body);
     
-    // Validate UUID format for account_id if provided
-    if (validatedData.account_id) {
+    // Validate UUID format for customer_company_id if provided
+    if (validatedData.customer_company_id) {
       const uuidSchema = z.string().uuid();
-      if (!uuidSchema.safeParse(validatedData.account_id).success) {
-        throw createError('Invalid company ID format', 400);
+      if (!uuidSchema.safeParse(validatedData.customer_company_id).success) {
+        throw createError('Invalid customer company ID format', 400);
       }
-      
-      // Check company access if account_id is provided
-      if (!isSuperAdmin(req.user!)) {
-        const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user!);
-        if (userCompanyId !== validatedData.account_id) {
-          logger.warn('Deal creation denied: Invalid company', { userId: req.user!.userId, requestedCompanyId: validatedData.account_id, userCompanyId });
-          throw createError('Forbidden: You can only create deals for your own company', 403);
-        }
-      }
+    }
+    
+    // Get tenant_id for the deal (use user's tenant)
+    const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user!);
+    if (!isSuperAdmin(req.user!) && !userTenantId) {
+      throw createError('Cannot create deal: User does not belong to a tenant', 403);
     }
     
     const result = await queryOne<DealQueryResult>(
       `INSERT INTO deals (
-        name, account_id, contact_id, owner_id, stage, value, 
+        tenant_id, name, customer_company_id, contact_id, owner_id, stage, value, 
         probability, expected_close_date, currency, description
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *`,
       [
+        userTenantId, // Add tenant_id
         validatedData.name,
-        validatedData.account_id || null,
+        validatedData.customer_company_id || null,
         validatedData.contact_id || null,
         validatedData.owner_id || null,
         validatedData.stage || 'lead',

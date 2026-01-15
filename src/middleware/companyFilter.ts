@@ -39,7 +39,9 @@ export const applyCompanyFilter = (tableAlias: string = '') => {
         req.userCompanyId
       );
 
-      const column = tableAlias ? `${tableAlias}.account_id` : 'account_id';
+      // Determine which column to use based on table alias
+      // Default to tenant_id for multi-tenant isolation
+      const column = tableAlias ? `${tableAlias}.tenant_id` : 'tenant_id';
       
       req.companyFilter = effectiveCompanyId !== null
         ? {

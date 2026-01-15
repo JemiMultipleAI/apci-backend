@@ -8,25 +8,26 @@ import { logger } from '../utils/logger';
 
 interface TaskQueryResult {
   id: string;
-  title: string;
+  subject: string; // title is stored as subject in activities
   description: string | null;
-  assigned_to: string | null;
+  assigned_to_user_id: string | null; // renamed from assigned_to
   related_to_type: string | null;
   related_to_id: string | null;
   due_date: Date | null;
-  status: string;
+  task_status: string; // renamed from status
   priority: string;
   created_at: Date;
-  updated_at: Date;
+  performed_by: string | null; // added from activities
   assigned_to_name: string | null;
+  performed_by_name: string | null;
 }
 
 const router = Router();
 
 const createTaskSchema = z.object({
-  title: z.string().min(1),
+  title: z.string().min(1), // Will be stored as subject
   description: z.string().optional().nullable(),
-  assigned_to: z.string().uuid().optional().nullable(),
+  assigned_to: z.string().uuid().optional().nullable(), // Will be stored as assigned_to_user_id
   related_to_type: z.enum(['contact', 'account', 'deal']).optional().nullable(),
   related_to_id: z.string().uuid().optional().nullable(),
   due_date: z.string().optional().nullable(),
@@ -34,7 +35,7 @@ const createTaskSchema = z.object({
   priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
 });
 
-// GET /api/tasks - List all tasks
+// GET /api/tasks - List all tasks (now queries activities WHERE type='task')
 router.get('/', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
@@ -61,17 +62,17 @@ router.get('/', authenticate, enrichUser, async (req: Request, res: Response, ne
       ? (company_id as string | undefined) || null
       : effectiveCompanyId;
     
-    let whereClause = 'WHERE 1=1';
+    let whereClause = "WHERE a.type = 'task'"; // Only get activities of type 'task'
     const params: (string | number)[] = [];
     let paramIndex = 1;
 
     // Optimized: Use JOINs instead of subqueries for better performance
     if (filterCompanyId !== null) {
       whereClause += ` AND (
-        u.account_id = $${paramIndex}
-        OR (t.related_to_type = 'account' AND t.related_to_id = $${paramIndex})
-        OR c.account_id = $${paramIndex}
-        OR d.account_id = $${paramIndex}
+        u.tenant_id = $${paramIndex}
+        OR (a.related_to_type = 'account' AND a.related_to_id = $${paramIndex})
+        OR c.tenant_id = $${paramIndex}
+        OR d.tenant_id = $${paramIndex}
       )`;
       params.push(filterCompanyId);
       paramIndex++;
@@ -80,7 +81,7 @@ router.get('/', authenticate, enrichUser, async (req: Request, res: Response, ne
     if (status) {
       const statusStr = Array.isArray(status) ? status[0] : status;
       if (typeof statusStr === 'string') {
-        whereClause += ` AND status = $${paramIndex}`;
+        whereClause += ` AND a.task_status = $${paramIndex}`;
         params.push(statusStr);
         paramIndex++;
       }
@@ -89,7 +90,7 @@ router.get('/', authenticate, enrichUser, async (req: Request, res: Response, ne
     if (assigned_to) {
       const assignedToStr = Array.isArray(assigned_to) ? assigned_to[0] : assigned_to;
       if (typeof assignedToStr === 'string') {
-        whereClause += ` AND assigned_to = $${paramIndex}`;
+        whereClause += ` AND a.assigned_to_user_id = $${paramIndex}`;
         params.push(assignedToStr);
         paramIndex++;
       }
@@ -98,49 +99,80 @@ router.get('/', authenticate, enrichUser, async (req: Request, res: Response, ne
     if (priority) {
       const priorityStr = Array.isArray(priority) ? priority[0] : priority;
       if (typeof priorityStr === 'string') {
-        whereClause += ` AND priority = $${paramIndex}`;
+        whereClause += ` AND a.priority = $${paramIndex}`;
         params.push(priorityStr);
         paramIndex++;
       }
     }
 
     const tasks = await query<TaskQueryResult>(
-      `SELECT t.*, 
-        u.first_name || ' ' || u.last_name as assigned_to_name
-       FROM tasks t
-       LEFT JOIN users u ON t.assigned_to = u.id
-       LEFT JOIN contacts c ON t.related_to_type = 'contact' AND t.related_to_id = c.id
-       LEFT JOIN deals d ON t.related_to_type = 'deal' AND t.related_to_id = d.id
+      `SELECT 
+        a.id,
+        a.subject,
+        a.description,
+        a.assigned_to_user_id,
+        a.related_to_type,
+        a.related_to_id,
+        a.due_date,
+        a.task_status,
+        a.priority,
+        a.created_at,
+        a.performed_by,
+        assigned_user.first_name || ' ' || assigned_user.last_name as assigned_to_name,
+        performed_user.first_name || ' ' || performed_user.last_name as performed_by_name
+       FROM activities a
+       LEFT JOIN users assigned_user ON a.assigned_to_user_id = assigned_user.id
+       LEFT JOIN users performed_user ON a.performed_by = performed_user.id
+       LEFT JOIN contacts c ON a.related_to_type = 'contact' AND a.related_to_id = c.id
+       LEFT JOIN deals d ON a.related_to_type = 'deal' AND a.related_to_id = d.id
+       LEFT JOIN users u ON a.performed_by = u.id
        ${whereClause} 
        ORDER BY 
-         CASE priority
+         CASE a.priority
            WHEN 'urgent' THEN 1
            WHEN 'high' THEN 2
            WHEN 'medium' THEN 3
            WHEN 'low' THEN 4
          END,
-         t.due_date ASC NULLS LAST,
-         t.created_at DESC
+         a.due_date ASC NULLS LAST,
+         a.created_at DESC
        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
       [...params, parseInt(limit as string), offset]
     );
 
     // Count query needs to match the JOIN structure
     const countResult = await queryOne<{ count: string }>(
-      `SELECT COUNT(DISTINCT t.id) as count 
-       FROM tasks t
-       LEFT JOIN users u ON t.assigned_to = u.id
-       LEFT JOIN contacts c ON t.related_to_type = 'contact' AND t.related_to_id = c.id
-       LEFT JOIN deals d ON t.related_to_type = 'deal' AND t.related_to_id = d.id
+      `SELECT COUNT(DISTINCT a.id) as count 
+       FROM activities a
+       LEFT JOIN users u ON a.performed_by = u.id
+       LEFT JOIN contacts c ON a.related_to_type = 'contact' AND a.related_to_id = c.id
+       LEFT JOIN deals d ON a.related_to_type = 'deal' AND a.related_to_id = d.id
        ${whereClause}`,
       params
     );
 
     const total = parseInt(countResult?.count || '0', 10);
 
+    // Transform to match old Task interface format for backward compatibility
+    const transformedTasks = tasks.map(t => ({
+      id: t.id,
+      title: t.subject,
+      description: t.description,
+      assigned_to: t.assigned_to_user_id,
+      related_to_type: t.related_to_type,
+      related_to_id: t.related_to_id,
+      due_date: t.due_date,
+      status: t.task_status,
+      priority: t.priority,
+      created_at: t.created_at,
+      assigned_to_name: t.assigned_to_name,
+      performed_by: t.performed_by,
+      performed_by_name: t.performed_by_name,
+    }));
+
     res.json({
       success: true,
-      data: tasks,
+      data: transformedTasks,
       pagination: {
         page: parseInt(page as string),
         limit: parseInt(limit as string),
@@ -153,7 +185,7 @@ router.get('/', authenticate, enrichUser, async (req: Request, res: Response, ne
   }
 });
 
-// GET /api/tasks/:id - Get single task
+// GET /api/tasks/:id - Get single task (now queries activities WHERE type='task')
 router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
@@ -169,11 +201,24 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
     }
     
     const task = await queryOne<TaskQueryResult>(
-      `SELECT t.*, 
-        u.first_name || ' ' || u.last_name as assigned_to_name
-       FROM tasks t
-       LEFT JOIN users u ON t.assigned_to = u.id
-       WHERE t.id = $1`,
+      `SELECT 
+        a.id,
+        a.subject,
+        a.description,
+        a.assigned_to_user_id,
+        a.related_to_type,
+        a.related_to_id,
+        a.due_date,
+        a.task_status,
+        a.priority,
+        a.created_at,
+        a.performed_by,
+        assigned_user.first_name || ' ' || assigned_user.last_name as assigned_to_name,
+        performed_user.first_name || ' ' || performed_user.last_name as performed_by_name
+       FROM activities a
+       LEFT JOIN users assigned_user ON a.assigned_to_user_id = assigned_user.id
+       LEFT JOIN users performed_user ON a.performed_by = performed_user.id
+       WHERE a.id = $1 AND a.type = 'task'`,
       [id]
     );
 
@@ -188,12 +233,12 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       let hasAccess = false;
       
       // Check by assigned_to user's company
-      if (task.assigned_to) {
-        const assignedUser = await queryOne<{ account_id: string | null }>(
-          'SELECT account_id FROM users WHERE id = $1',
-          [task.assigned_to]
+      if (task.assigned_to_user_id) {
+        const assignedUser = await queryOne<{ tenant_id: string | null }>(
+          'SELECT tenant_id FROM users WHERE id = $1',
+          [task.assigned_to_user_id]
         );
-        if (assignedUser?.account_id === userCompanyId) {
+        if (assignedUser?.tenant_id === userCompanyId) {
           hasAccess = true;
         }
       }
@@ -203,19 +248,19 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
         if (task.related_to_type === 'account' && task.related_to_id === userCompanyId) {
           hasAccess = true;
         } else if (task.related_to_type === 'contact') {
-          const contact = await queryOne<{ account_id: string | null }>(
-            'SELECT account_id FROM contacts WHERE id = $1',
+          const contact = await queryOne<{ tenant_id: string | null }>(
+            'SELECT tenant_id FROM contacts WHERE id = $1',
             [task.related_to_id]
           );
-          if (contact?.account_id === userCompanyId) {
+          if (contact?.tenant_id === userCompanyId) {
             hasAccess = true;
           }
         } else if (task.related_to_type === 'deal') {
-          const deal = await queryOne<{ account_id: string | null }>(
-            'SELECT account_id FROM deals WHERE id = $1',
+          const deal = await queryOne<{ tenant_id: string | null }>(
+            'SELECT tenant_id FROM deals WHERE id = $1',
             [task.related_to_id]
           );
-          if (deal?.account_id === userCompanyId) {
+          if (deal?.tenant_id === userCompanyId) {
             hasAccess = true;
           }
         }
@@ -227,16 +272,33 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       }
     }
 
+    // Transform to match old Task interface format
+    const transformedTask = {
+      id: task.id,
+      title: task.subject,
+      description: task.description,
+      assigned_to: task.assigned_to_user_id,
+      related_to_type: task.related_to_type,
+      related_to_id: task.related_to_id,
+      due_date: task.due_date,
+      status: task.task_status,
+      priority: task.priority,
+      created_at: task.created_at,
+      assigned_to_name: task.assigned_to_name,
+      performed_by: task.performed_by,
+      performed_by_name: task.performed_by_name,
+    };
+
     res.json({
       success: true,
-      data: task,
+      data: transformedTask,
     });
   } catch (error) {
     next(error);
   }
 });
 
-// POST /api/tasks - Create new task
+// POST /api/tasks - Create new task (now creates activity with type='task')
 router.post('/', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = createTaskSchema.parse(req.body);
@@ -256,19 +318,19 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
         if (validatedData.related_to_type === 'account' && validatedData.related_to_id === userCompanyId) {
           hasAccess = true;
         } else if (validatedData.related_to_type === 'contact') {
-          const contact = await queryOne<{ account_id: string | null }>(
-            'SELECT account_id FROM contacts WHERE id = $1',
+          const contact = await queryOne<{ tenant_id: string | null }>(
+            'SELECT tenant_id FROM contacts WHERE id = $1',
             [validatedData.related_to_id]
           );
-          if (contact?.account_id === userCompanyId) {
+          if (contact?.tenant_id === userCompanyId) {
             hasAccess = true;
           }
         } else if (validatedData.related_to_type === 'deal') {
-          const deal = await queryOne<{ account_id: string | null }>(
-            'SELECT account_id FROM deals WHERE id = $1',
+          const deal = await queryOne<{ tenant_id: string | null }>(
+            'SELECT tenant_id FROM deals WHERE id = $1',
             [validatedData.related_to_id]
           );
-          if (deal?.account_id === userCompanyId) {
+          if (deal?.tenant_id === userCompanyId) {
             hasAccess = true;
           }
         }
@@ -280,27 +342,64 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
       }
     }
     
+    // Get tenant_id for activity
+    let tenantId: string | null = null;
+    if (!isSuperAdmin(req.user!)) {
+      tenantId = req.userCompanyId ?? await getUserCompanyId(req.user!);
+    }
+
+    // Create activity with type='task'
     const result = await queryOne<TaskQueryResult>(
-      `INSERT INTO tasks (
-        title, description, assigned_to, related_to_type, related_to_id,
-        due_date, status, priority
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *`,
+      `INSERT INTO activities (
+        type, subject, description, assigned_to_user_id, related_to_type, related_to_id,
+        due_date, task_status, priority, performed_by, tenant_id
+      ) VALUES ('task', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING id, subject, description, assigned_to_user_id, related_to_type, related_to_id,
+        due_date, task_status, priority, created_at, performed_by`,
       [
-        validatedData.title,
+        validatedData.title, // Store title as subject
         validatedData.description || null,
-        validatedData.assigned_to || null,
+        validatedData.assigned_to || null, // Store as assigned_to_user_id
         validatedData.related_to_type || null,
         validatedData.related_to_id || null,
         validatedData.due_date || null,
-        validatedData.status || 'pending',
+        validatedData.status || 'pending', // Store as task_status
         validatedData.priority || 'medium',
+        req.user?.userId || null,
+        tenantId,
       ]
     );
 
+    // Get assigned user name if applicable
+    let assignedToName = null;
+    if (result?.assigned_to_user_id) {
+      const assignedUser = await queryOne<{ first_name: string | null; last_name: string | null }>(
+        'SELECT first_name, last_name FROM users WHERE id = $1',
+        [result.assigned_to_user_id]
+      );
+      if (assignedUser) {
+        assignedToName = [assignedUser.first_name, assignedUser.last_name].filter(Boolean).join(' ') || null;
+      }
+    }
+
+    // Transform to match old Task interface format
+    const transformedTask = {
+      id: result!.id,
+      title: result!.subject,
+      description: result!.description,
+      assigned_to: result!.assigned_to_user_id,
+      related_to_type: result!.related_to_type,
+      related_to_id: result!.related_to_id,
+      due_date: result!.due_date,
+      status: result!.task_status,
+      priority: result!.priority,
+      created_at: result!.created_at,
+      assigned_to_name: assignedToName,
+    };
+
     res.status(201).json({
       success: true,
-      data: result,
+      data: transformedTask,
     });
   } catch (error) {
     if (error instanceof ZodError) {
@@ -310,13 +409,13 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
   }
 });
 
-// PUT /api/tasks/:id - Update task
+// PUT /api/tasks/:id - Update task (now updates activity with type='task')
 router.put('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     const validatedData = createTaskSchema.partial().parse(req.body);
 
-    const existing = await queryOne('SELECT id FROM tasks WHERE id = $1', [id]);
+    const existing = await queryOne('SELECT id FROM activities WHERE id = $1 AND type = \'task\'', [id]);
     if (!existing) {
       throw createError('Task not found', 404);
     }
@@ -325,10 +424,21 @@ router.put('/:id', authenticate, async (req: Request, res: Response, next: NextF
     const values: any[] = [];
     let paramIndex = 1;
 
+    // Map old field names to new activity field names
     Object.entries(validatedData).forEach(([key, value]) => {
-      updates.push(`${key} = $${paramIndex}`);
-      values.push(value);
-      paramIndex++;
+      if (key === 'title') {
+        updates.push(`subject = $${paramIndex++}`);
+        values.push(value);
+      } else if (key === 'assigned_to') {
+        updates.push(`assigned_to_user_id = $${paramIndex++}`);
+        values.push(value);
+      } else if (key === 'status') {
+        updates.push(`task_status = $${paramIndex++}`);
+        values.push(value);
+      } else {
+        updates.push(`${key} = $${paramIndex++}`);
+        values.push(value);
+      }
     });
 
     if (updates.length === 0) {
@@ -336,14 +446,45 @@ router.put('/:id', authenticate, async (req: Request, res: Response, next: NextF
     }
 
     values.push(id);
-    const result = await queryOne(
-      `UPDATE tasks SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIndex} RETURNING *`,
+    const result = await queryOne<TaskQueryResult>(
+      `UPDATE activities 
+       SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $${paramIndex} AND type = 'task'
+       RETURNING id, subject, description, assigned_to_user_id, related_to_type, related_to_id,
+         due_date, task_status, priority, created_at, performed_by`,
       values
     );
 
+    // Get assigned user name
+    let assignedToName = null;
+    if (result?.assigned_to_user_id) {
+      const assignedUser = await queryOne<{ first_name: string | null; last_name: string | null }>(
+        'SELECT first_name, last_name FROM users WHERE id = $1',
+        [result.assigned_to_user_id]
+      );
+      if (assignedUser) {
+        assignedToName = [assignedUser.first_name, assignedUser.last_name].filter(Boolean).join(' ') || null;
+      }
+    }
+
+    // Transform to match old Task interface format
+    const transformedTask = {
+      id: result!.id,
+      title: result!.subject,
+      description: result!.description,
+      assigned_to: result!.assigned_to_user_id,
+      related_to_type: result!.related_to_type,
+      related_to_id: result!.related_to_id,
+      due_date: result!.due_date,
+      status: result!.task_status,
+      priority: result!.priority,
+      created_at: result!.created_at,
+      assigned_to_name: assignedToName,
+    };
+
     res.json({
       success: true,
-      data: result,
+      data: transformedTask,
     });
   } catch (error) {
     if (error instanceof ZodError) {
@@ -353,11 +494,11 @@ router.put('/:id', authenticate, async (req: Request, res: Response, next: NextF
   }
 });
 
-// DELETE /api/tasks/:id - Delete task
+// DELETE /api/tasks/:id - Delete task (now deletes activity with type='task')
 router.delete('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
-    const result = await queryOne('DELETE FROM tasks WHERE id = $1 RETURNING id', [id]);
+    const result = await queryOne('DELETE FROM activities WHERE id = $1 AND type = \'task\' RETURNING id', [id]);
 
     if (!result) {
       throw createError('Task not found', 404);
@@ -373,4 +514,3 @@ router.delete('/:id', authenticate, async (req: Request, res: Response, next: Ne
 });
 
 export default router;
-

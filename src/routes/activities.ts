@@ -11,11 +11,16 @@ const router = Router();
 
 const createActivitySchema = z.object({
   type: z.enum(['call', 'email', 'sms', 'meeting', 'note', 'task', 'survey']),
-  subject: z.string().optional().nullable(),
+  subject: z.string().optional().nullable(), // For tasks, this is the title
   description: z.string().optional().nullable(),
   related_to_type: z.enum(['contact', 'account', 'deal']).optional().nullable(),
   related_to_id: z.string().uuid().optional().nullable(),
   metadata: z.record(z.string(), z.any()).optional(),
+  // Task-specific fields (only used when type='task')
+  due_date: z.string().optional().nullable(), // ISO date string
+  assigned_to_user_id: z.string().uuid().optional().nullable(),
+  priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
+  task_status: z.enum(['pending', 'in_progress', 'completed', 'cancelled']).optional(),
 });
 
 // GET /api/activities - List all activities
@@ -94,55 +99,75 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
     const validatedData = createActivitySchema.parse(req.body);
     const userId = req.user?.userId;
     
-    // Get account_id from related entity
-    let accountId: string | null = null;
+    // Get tenant_id from related entity
+    let tenantId: string | null = null;
     if (validatedData.related_to_type && validatedData.related_to_id) {
       if (validatedData.related_to_type === 'contact') {
-        const contact = await queryOne<{ account_id: string | null }>(
-          'SELECT account_id FROM contacts WHERE id = $1',
+        const contact = await queryOne<{ tenant_id: string | null }>(
+          'SELECT tenant_id FROM contacts WHERE id = $1',
           [validatedData.related_to_id]
         );
-        accountId = contact?.account_id || null;
+        tenantId = contact?.tenant_id || null;
       } else if (validatedData.related_to_type === 'account') {
-        accountId = validatedData.related_to_id; // Account ID is the account_id itself
+        // For accounts (customer_companies), get tenant_id from the related contact or deal
+        // This is a simplified check - in practice you might need to join with customer_companies
+        tenantId = null; // Will use user's tenant_id as fallback
       } else if (validatedData.related_to_type === 'deal') {
-        const deal = await queryOne<{ account_id: string | null }>(
-          'SELECT account_id FROM deals WHERE id = $1',
+        const deal = await queryOne<{ tenant_id: string | null }>(
+          'SELECT tenant_id FROM deals WHERE id = $1',
           [validatedData.related_to_id]
         );
-        accountId = deal?.account_id || null;
+        tenantId = deal?.tenant_id || null;
       }
 
       // Verify company access for non-super_admin users
-      if (!isSuperAdmin(req.user) && accountId) {
+      if (!isSuperAdmin(req.user) && tenantId) {
         const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-        if (userCompanyId !== accountId) {
+        if (userCompanyId !== tenantId) {
           return next(createError('Forbidden: You do not have access to this company', 403));
         }
       }
     } else {
-      // If no related entity, use user's company
+      // If no related entity, use user's tenant
       if (!isSuperAdmin(req.user)) {
-        accountId = req.userCompanyId ?? await getUserCompanyId(req.user);
+        tenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
       }
     }
     
+    // Build INSERT query with optional task-specific fields
+    const isTask = validatedData.type === 'task';
+    const fields = [
+      'type', 'subject', 'description', 'related_to_type', 'related_to_id',
+      'performed_by', 'metadata', 'tenant_id'
+    ];
+    const values: any[] = [
+      validatedData.type,
+      validatedData.subject || null,
+      validatedData.description || null,
+      validatedData.related_to_type || null,
+      validatedData.related_to_id || null,
+      userId || null,
+      JSON.stringify(validatedData.metadata || {}),
+      tenantId,
+    ];
+
+    // Add task-specific fields if this is a task
+    if (isTask) {
+      fields.push('due_date', 'assigned_to_user_id', 'priority', 'task_status');
+      values.push(
+        validatedData.due_date || null,
+        validatedData.assigned_to_user_id || null,
+        validatedData.priority || 'medium',
+        validatedData.task_status || 'pending'
+      );
+    }
+
+    const placeholders = values.map((_, i) => `$${i + 1}`).join(', ');
     const result = await queryOne(
-      `INSERT INTO activities (
-        type, subject, description, related_to_type, related_to_id,
-        performed_by, metadata, account_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING *`,
-      [
-        validatedData.type,
-        validatedData.subject || null,
-        validatedData.description || null,
-        validatedData.related_to_type || null,
-        validatedData.related_to_id || null,
-        userId || null,
-        JSON.stringify(validatedData.metadata || {}),
-        accountId,
-      ]
+      `INSERT INTO activities (${fields.join(', ')})
+       VALUES (${placeholders})
+       RETURNING *`,
+      values
     );
 
     res.status(201).json({

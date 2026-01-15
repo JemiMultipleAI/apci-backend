@@ -192,52 +192,17 @@ router.post('/reactivate', authenticate, enrichUser, async (req: Request, res: R
       });
     }
 
-    // Get or create a default template if not provided
-    let templateId = validatedData.template_id;
-    if (!templateId) {
-      // Try to find a default reactivation template
-      const defaultTemplate = await queryOne<{ id: string }>(
-        `SELECT id FROM templates 
-         WHERE type = 'email' 
-         AND (name ILIKE '%reactivation%' OR name ILIKE '%reactivate%')
-         ORDER BY created_at DESC 
-         LIMIT 1`
-      );
-      
-      if (defaultTemplate) {
-        templateId = defaultTemplate.id;
-      } else {
-        // Get any email template as fallback
-        const anyTemplate = await queryOne<{ id: string }>(
-          `SELECT id FROM templates 
-           WHERE type = 'email' 
-           ORDER BY created_at DESC 
-           LIMIT 1`
-        );
-        
-        if (!anyTemplate) {
-          throw createError('No template found. Please create a template first or provide template_id', 400);
-        }
-        
-        templateId = anyTemplate.id;
-        logger.info('Using fallback template for reactivation', { templateId });
-      }
-    }
+    // Templates are deprecated - use instructions instead
+    // Generate default reactivation instructions if not provided
+    const instructions = validatedData.instructions || 
+      `You are reaching out to dormant contacts who haven't been active in ${validatedData.days_inactive || 90} days. 
+Your goal is to:
+1. Re-engage them with a friendly, personalized message
+2. Understand why they haven't been active
+3. Offer value or updates that might interest them
+4. Encourage them to reconnect with your company
 
-    // Verify template exists and user has access
-    const template = await queryOne<{ id: string; type: string; account_id: string | null }>(
-      'SELECT id, type, account_id FROM templates WHERE id = $1',
-      [templateId]
-    );
-
-    if (!template) {
-      throw createError('Template not found', 404);
-    }
-
-    // Check template access for non-super_admin users
-    if (!isSuperAdmin(req.user) && template.account_id && template.account_id !== userCompanyId) {
-      throw createError('Forbidden: You do not have access to this template', 403);
-    }
+Be warm, genuine, and avoid being pushy. Focus on rebuilding the relationship.`;
 
     // Check if this is a scheduled reactivation
     let startDate: Date | null = null;
@@ -262,23 +227,22 @@ router.post('/reactivate', authenticate, enrichUser, async (req: Request, res: R
     
     const campaignMetadata = {
       contact_ids: contacts.map((c: any) => c.id),
-      template_id: templateId,
       days_inactive: validatedData.days_inactive,
       auto_created: true,
       reactivation_type: startDate ? 'scheduled' : 'manual',
     };
 
     const campaign = await queryOne(
-      `INSERT INTO campaigns (name, type, channel, status, created_by, start_date, metadata)
+      `INSERT INTO campaigns (name, channel, status, created_by, start_date, instructions, metadata)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
       [
         campaignName,
-        'reactivation',
         validatedData.channel,
         campaignStatus,
         userId,
         startDate,
+        instructions,
         JSON.stringify(campaignMetadata),
       ]
     );
@@ -290,7 +254,6 @@ router.post('/reactivate', authenticate, enrichUser, async (req: Request, res: R
         contactCount: contacts.length,
         scheduledDate: startDate.toISOString(),
         channel: validatedData.channel,
-        templateId,
       });
 
       return res.json({
@@ -309,188 +272,24 @@ router.post('/reactivate', authenticate, enrichUser, async (req: Request, res: R
       campaignId: campaign.id,
       contactCount: contacts.length,
       channel: validatedData.channel,
-      templateId,
     });
 
-    // Execute the campaign using internal services
+    // Execute the campaign using the campaign queue service
+    // The campaign queue will use the instructions field for AI-generated content
+    const { addCampaignJobs } = await import('../services/campaignQueue');
+    
+    // Queue campaign jobs for execution
+    await addCampaignJobs(campaign.id, contacts.map((c: any) => c.id), userCompanyId || undefined);
 
-    const results = {
-      total: contacts.length,
-      success: 0,
-      failed: 0,
-      errors: [] as string[],
-      campaign_id: campaign.id,
-    };
-
-    // Get full template details
-    const fullTemplate = await queryOne('SELECT * FROM templates WHERE id = $1', [templateId]);
-
-    for (const contact of contacts) {
-      try {
-        // Prepare template variables
-        const variables: Record<string, string> = {
-          first_name: contact.first_name || '',
-          last_name: contact.last_name || '',
-          full_name: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
-        };
-
-        // Replace variables in template
-        let subject = fullTemplate.subject || '';
-        let body = fullTemplate.body || '';
-        
-        Object.keys(variables).forEach(key => {
-          const regex = new RegExp(`{{${key}}}`, 'g');
-          subject = subject.replace(regex, variables[key]);
-          body = body.replace(regex, variables[key]);
-        });
-
-        // Create webhook token for replies
-        let webhookToken: any = null;
-        if (userCompanyId && (validatedData.channel === 'email' || validatedData.channel === 'sms' || validatedData.channel === 'multi')) {
-          try {
-            const tokenType = validatedData.channel === 'email' ? 'email' : validatedData.channel === 'sms' ? 'sms' : 'both';
-            webhookToken = await createWebhookToken({
-              account_id: userCompanyId,
-              campaign_id: campaign.id,
-              contact_id: contact.id,
-              type: tokenType,
-              created_by: userId,
-            });
-          } catch (error: any) {
-            logger.warn('Failed to create webhook token', { error: error.message, contactId: contact.id });
-          }
-        }
-
-        let success = false;
-        let activityType = 'note';
-        let activityDescription = '';
-
-        // Send based on channel
-        if (validatedData.channel === 'email' || validatedData.channel === 'multi') {
-          if (!contact.email) {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: No email address`);
-            continue;
-          }
-
-          const replyToEmail = webhookToken ? generateReplyToEmail(webhookToken.token) : undefined;
-          const emailResult = await sendEmailFromTemplate(
-            contact.email,
-            subject,
-            body,
-            variables,
-            undefined,
-            replyToEmail
-          );
-
-          if (emailResult.success) {
-            success = true;
-            activityType = 'email';
-            activityDescription = `Sent reactivation email: ${subject}`;
-          } else {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: ${emailResult.error}`);
-            continue;
-          }
-        }
-
-        if (validatedData.channel === 'sms' || validatedData.channel === 'multi') {
-          if (!contact.mobile) {
-            if (validatedData.channel === 'sms') {
-              results.failed++;
-              results.errors.push(`${contact.first_name} ${contact.last_name}: No mobile number`);
-              continue;
-            }
-          } else {
-            const smsResult = await sendSMSFromTemplate(contact.mobile, body, variables);
-            if (smsResult.success) {
-              success = true;
-              activityType = validatedData.channel === 'multi' ? 'sms' : 'sms';
-              activityDescription = validatedData.channel === 'multi' 
-                ? `${activityDescription}; Sent reactivation SMS`
-                : `Sent reactivation SMS: ${body.substring(0, 50)}...`;
-            } else {
-              if (validatedData.channel === 'sms') {
-                results.failed++;
-                results.errors.push(`${contact.first_name} ${contact.last_name}: ${smsResult.error}`);
-                continue;
-              }
-            }
-          }
-        }
-
-        if (validatedData.channel === 'call') {
-          if (!contact.mobile) {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: No mobile number`);
-            continue;
-          }
-
-          const callResult = await makeVoiceCallFromTemplate(contact.mobile, body, variables);
-          if (callResult.success) {
-            success = true;
-            activityType = 'call';
-            activityDescription = `Made reactivation call`;
-          } else {
-            results.failed++;
-            results.errors.push(`${contact.first_name} ${contact.last_name}: ${callResult.error}`);
-            continue;
-          }
-        }
-
-        if (success) {
-          // Create activity record
-          const activityMetadata: any = {
-            campaign_id: campaign.id,
-            reactivation: true,
-            channel: validatedData.channel,
-          };
-
-          if (webhookToken) {
-            activityMetadata.webhook_token_id = webhookToken.id;
-            activityMetadata.webhook_token = webhookToken.token;
-            if (validatedData.channel === 'email' || validatedData.channel === 'multi') {
-              activityMetadata.reply_to_email = webhookToken ? generateReplyToEmail(webhookToken.token) : undefined;
-            }
-          }
-
-          await queryOne(
-            `INSERT INTO activities (type, subject, description, related_to_type, related_to_id, performed_by, metadata, account_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             RETURNING id`,
-            [
-              activityType,
-              subject || null,
-              activityDescription,
-              'contact',
-              contact.id,
-              userId,
-              JSON.stringify(activityMetadata),
-              contact.account_id,
-            ]
-          );
-
-          results.success++;
-        }
-      } catch (error: any) {
-        logger.error('Error reactivating contact', {
-          contactId: contact.id,
-          error: error.message,
-        });
-        results.failed++;
-        results.errors.push(`${contact.first_name} ${contact.last_name}: ${error.message}`);
-      }
-    }
-
-    // Update campaign status
-    await query(
-      'UPDATE campaigns SET status = $1 WHERE id = $2',
-      [results.failed === 0 ? 'completed' : 'running', campaign.id]
-    );
-
-    res.json({
+    // Return success response - actual execution happens via queue
+    return res.json({
       success: true,
-      data: results,
+      data: {
+        campaign_id: campaign.id,
+        total: contacts.length,
+        queued: contacts.length,
+        message: 'Campaign queued for execution',
+      },
     });
   } catch (error) {
     if (error instanceof z.ZodError) {

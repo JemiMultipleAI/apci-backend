@@ -19,7 +19,8 @@ interface AccountQueryResult {
   state: string | null;
   country: string | null;
   postal_code: string | null;
-  parent_account_id: string | null;
+  tenant_id: string | null; // Updated: for multi-tenant isolation
+  parent_customer_company_id: string | null; // Updated: parent_account_id → parent_customer_company_id
   owner_id: string | null;
   account_score: number;
   created_at: Date;
@@ -39,7 +40,7 @@ const createAccountSchema = z.object({
   state: z.string().optional().nullable(),
   country: z.string().optional().nullable(),
   postal_code: z.string().optional().nullable(),
-  parent_account_id: z.string().uuid().optional().nullable(),
+  parent_customer_company_id: z.string().uuid().optional().nullable(), // Updated: parent_account_id → parent_customer_company_id
   owner_id: z.string().uuid().optional().nullable(),
 });
 
@@ -57,9 +58,9 @@ router.get('/', authenticate, enrichUser, applyCompanyFilter('a'), async (req: R
     const params: (string | number)[] = [];
     let paramIndex = 1;
 
-    // Apply company filter if available (for accounts, filter by account.id)
+    // Apply tenant filter (for customer companies, filter by tenant_id)
     if (req.companyFilter && req.companyFilter.value !== null) {
-      whereClause += ` AND a.id = $${paramIndex}`;
+      whereClause += ` AND a.tenant_id = $${paramIndex}`;
       params.push(req.companyFilter.value);
       paramIndex = req.companyFilter.paramIndex + 1;
     }
@@ -84,17 +85,17 @@ router.get('/', authenticate, enrichUser, applyCompanyFilter('a'), async (req: R
 
     const accounts = await query<AccountQueryResult & { contact_count: number; deal_count: number; total_revenue: number }>(
       `SELECT a.*, 
-        (SELECT COUNT(*) FROM contacts WHERE account_id = a.id) as contact_count,
-        (SELECT COUNT(*) FROM deals WHERE account_id = a.id) as deal_count,
-        (SELECT COALESCE(SUM(value), 0) FROM deals WHERE account_id = a.id AND stage = 'closed_won') as total_revenue
-       FROM accounts a ${whereClause} 
+        (SELECT COUNT(*) FROM contacts WHERE customer_company_id = a.id) as contact_count,
+        (SELECT COUNT(*) FROM deals WHERE customer_company_id = a.id) as deal_count,
+        (SELECT COALESCE(SUM(value), 0) FROM deals WHERE customer_company_id = a.id AND stage = 'closed_won') as total_revenue
+       FROM customer_companies a ${whereClause} 
        ORDER BY a.created_at DESC 
        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
       [...params, parseInt(limit as string), offset]
     );
 
     const countResult = await queryOne<{ count: string }>(
-      `SELECT COUNT(*) as count FROM accounts a ${whereClause}`,
+      `SELECT COUNT(*) as count FROM customer_companies a ${whereClause}`,
       params
     );
 
@@ -132,10 +133,10 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
     
     const account = await queryOne<AccountQueryResult & { contact_count: number; deal_count: number; total_revenue: number }>(
       `SELECT a.*, 
-        (SELECT COUNT(*) FROM contacts WHERE account_id = a.id) as contact_count,
-        (SELECT COUNT(*) FROM deals WHERE account_id = a.id) as deal_count,
-        (SELECT COALESCE(SUM(value), 0) FROM deals WHERE account_id = a.id AND stage = 'closed_won') as total_revenue
-       FROM accounts a WHERE a.id = $1`,
+        (SELECT COUNT(*) FROM contacts WHERE customer_company_id = a.id) as contact_count,
+        (SELECT COUNT(*) FROM deals WHERE customer_company_id = a.id) as deal_count,
+        (SELECT COALESCE(SUM(value), 0) FROM deals WHERE customer_company_id = a.id AND stage = 'closed_won') as total_revenue
+       FROM customer_companies a WHERE a.id = $1`,
       [id]
     );
 
@@ -143,16 +144,16 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       throw createError('Account not found', 404);
     }
 
-    // Check company access using cached company_id
-    const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-    if (!isSuperAdmin(req.user) && userCompanyId !== id) {
-      logger.warn('Company access denied', { userId: req.user.userId, requestedCompanyId: id, userCompanyId });
+    // Check tenant access
+    const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+    if (!isSuperAdmin(req.user) && account.tenant_id && userTenantId !== account.tenant_id) {
+      logger.warn('Company access denied', { userId: req.user.userId, requestedCompanyId: id, customerCompanyTenantId: account.tenant_id, userTenantId });
       throw createError('Forbidden: You do not have access to this company', 403);
     }
 
-    // Get child accounts
+    // Get child accounts (customer companies)
     const childAccounts = await query(
-      'SELECT id, name FROM accounts WHERE parent_account_id = $1',
+      'SELECT id, name FROM customer_companies WHERE parent_customer_company_id = $1',
       [id]
     );
 
@@ -175,11 +176,11 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
     
     const validatedData = createAccountSchema.parse(req.body);
     
-    // Validate UUID format for parent_account_id and owner_id if provided
-    if (validatedData.parent_account_id) {
+    // Validate UUID format for parent_customer_company_id and owner_id if provided
+    if (validatedData.parent_customer_company_id) {
       const uuidSchema = z.string().uuid();
-      if (!uuidSchema.safeParse(validatedData.parent_account_id).success) {
-        throw createError('Invalid parent account ID format', 400);
+      if (!uuidSchema.safeParse(validatedData.parent_customer_company_id).success) {
+        throw createError('Invalid parent company ID format', 400);
       }
     }
     
@@ -190,13 +191,20 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
       }
     }
     
+    // Get tenant_id for the customer company (use user's tenant)
+    const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user!);
+    if (!isSuperAdmin(req.user!) && !userTenantId) {
+      throw createError('Cannot create company: User does not belong to a tenant', 403);
+    }
+
     const result = await queryOne(
-      `INSERT INTO accounts (
-        name, website, industry, phone, email, address, city, state, 
-        country, postal_code, parent_account_id, owner_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO customer_companies (
+        tenant_id, name, website, industry, phone, email, address, city, state, 
+        country, postal_code, parent_customer_company_id, owner_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING *`,
       [
+        userTenantId, // Add tenant_id
         validatedData.name,
         validatedData.website || null,
         validatedData.industry || null,
@@ -207,7 +215,7 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
         validatedData.state || null,
         validatedData.country || null,
         validatedData.postal_code || null,
-        validatedData.parent_account_id || null,
+        validatedData.parent_customer_company_id || null,
         validatedData.owner_id || null,
       ]
     );
@@ -230,9 +238,15 @@ router.put('/:id', authenticate, async (req: Request, res: Response, next: NextF
     const { id } = req.params;
     const validatedData = createAccountSchema.partial().parse(req.body);
 
-    const existing = await queryOne('SELECT id FROM accounts WHERE id = $1', [id]);
+    const existing = await queryOne('SELECT id, tenant_id FROM customer_companies WHERE id = $1', [id]);
     if (!existing) {
       throw createError('Account not found', 404);
+    }
+
+    // Check tenant access
+    const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user!);
+    if (!isSuperAdmin(req.user!) && existing.tenant_id && userTenantId !== existing.tenant_id) {
+      throw createError('Forbidden: You do not have access to this company', 403);
     }
 
     const updates: string[] = [];
@@ -251,7 +265,7 @@ router.put('/:id', authenticate, async (req: Request, res: Response, next: NextF
 
     values.push(id);
     const result = await queryOne(
-      `UPDATE accounts SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIndex} RETURNING *`,
+      `UPDATE customer_companies SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIndex} RETURNING *`,
       values
     );
 
@@ -271,7 +285,18 @@ router.put('/:id', authenticate, async (req: Request, res: Response, next: NextF
 router.delete('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
-    const result = await queryOne('DELETE FROM accounts WHERE id = $1 RETURNING id', [id]);
+    // Check tenant access before deletion
+    const existing = await queryOne<{ tenant_id: string | null }>('SELECT tenant_id FROM customer_companies WHERE id = $1', [id]);
+    if (!existing) {
+      throw createError('Account not found', 404);
+    }
+    
+    const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user!);
+    if (!isSuperAdmin(req.user!) && existing.tenant_id && userTenantId !== existing.tenant_id) {
+      throw createError('Forbidden: You do not have access to this company', 403);
+    }
+
+    const result = await queryOne('DELETE FROM customer_companies WHERE id = $1 RETURNING id', [id]);
 
     if (!result) {
       throw createError('Account not found', 404);

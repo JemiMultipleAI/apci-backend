@@ -5,23 +5,23 @@ import { logger } from './logger';
  * Fetch and format campaign data for knowledge base
  * Returns formatted text with: name, description, instructions, start_date, end_date
  */
-export async function getCampaignsKnowledgeBaseText(companyId: string): Promise<string> {
+export async function getCampaignsKnowledgeBaseText(tenantId: string): Promise<string> {
   try {
     const campaigns = await query(
       `SELECT c.id, c.name, c.description, c.instructions, c.start_date, c.end_date
        FROM campaigns c
        INNER JOIN users u ON c.created_by = u.id
-       WHERE u.account_id = $1
+       WHERE u.tenant_id = $1
        AND c.status = 'running'
        AND (c.start_date IS NULL OR c.start_date <= CURRENT_TIMESTAMP)
        AND (c.end_date IS NULL OR c.end_date >= CURRENT_TIMESTAMP)
        ORDER BY c.created_at DESC
        LIMIT 10`,
-      [companyId]
+      [tenantId]
     );
 
     logger.debug('[KNOWLEDGE_BASE] Fetched campaigns', {
-      companyId,
+      tenantId,
       campaignCount: campaigns.length,
     });
 
@@ -51,7 +51,7 @@ export async function getCampaignsKnowledgeBaseText(companyId: string): Promise<
     logger.error('[KNOWLEDGE_BASE] Failed to fetch campaigns', {
       error: error.message,
       stack: error.stack,
-      companyId,
+      tenantId,
     });
     return 'No active campaigns found.';
   }
@@ -61,21 +61,21 @@ export async function getCampaignsKnowledgeBaseText(companyId: string): Promise<
  * Fetch and format deals data for knowledge base
  * Returns formatted text with deal information
  */
-export async function getDealsKnowledgeBaseText(companyId: string): Promise<string> {
+export async function getDealsKnowledgeBaseText(tenantId: string): Promise<string> {
   try {
     const deals = await query(
       `SELECT id, name, description, stage, value, probability, 
               expected_close_date, currency
        FROM deals
-       WHERE account_id = $1
+       WHERE tenant_id = $1
        AND stage NOT IN ('closed_won', 'closed_lost')
        ORDER BY created_at DESC
        LIMIT 10`,
-      [companyId]
+      [tenantId]
     );
 
     logger.debug('[KNOWLEDGE_BASE] Fetched deals', {
-      companyId,
+      tenantId,
       dealCount: deals.length,
     });
 
@@ -100,7 +100,7 @@ export async function getDealsKnowledgeBaseText(companyId: string): Promise<stri
     logger.error('[KNOWLEDGE_BASE] Failed to fetch deals', {
       error: error.message,
       stack: error.stack,
-      companyId,
+      tenantId,
     });
     return 'No open deals found.';
   }

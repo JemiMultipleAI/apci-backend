@@ -133,7 +133,8 @@ campaignQueue.process('campaign-message', 1, async (job) => {
     // Get contact
     const contact = await queryOne<{
       id: string;
-      account_id: string | null;
+      tenant_id: string | null;
+      customer_company_id: string | null;
       first_name: string;
       last_name: string;
       email: string | null;
@@ -158,30 +159,30 @@ campaignQueue.process('campaign-message', 1, async (job) => {
       throw new Error(`Campaign ${campaignId} not found`);
     }
 
-    // CRITICAL: Ensure accountId is available - try multiple sources
-    // 1. From job data (accountId parameter)
-    // 2. From contact.account_id
-    // 3. From campaign creator's account_id (if contact doesn't have one)
-    let effectiveAccountId = accountId || contact.account_id || null;
+    // CRITICAL: Ensure tenantId is available - try multiple sources
+    // 1. From job data (accountId parameter - now represents tenant_id)
+    // 2. From contact.tenant_id
+    // 3. From campaign creator's tenant_id (if contact doesn't have one)
+    let effectiveTenantId = accountId || contact.tenant_id || null;
 
-    if (!effectiveAccountId && campaign.created_by) {
+    if (!effectiveTenantId && campaign.created_by) {
       try {
-        const creator = await queryOne<{ account_id: string | null }>(
-          'SELECT account_id FROM users WHERE id = $1',
+        const creator = await queryOne<{ tenant_id: string | null }>(
+          'SELECT tenant_id FROM users WHERE id = $1',
           [campaign.created_by]
         );
-        if (creator?.account_id) {
-          effectiveAccountId = creator.account_id;
-          logger.info('[CAMPAIGN_QUEUE] Using accountId from campaign creator', {
-            accountId: effectiveAccountId,
+        if (creator?.tenant_id) {
+          effectiveTenantId = creator.tenant_id;
+          logger.info('[CAMPAIGN_QUEUE] Using tenantId from campaign creator', {
+            tenantId: effectiveTenantId,
             campaignId,
             contactId,
             channel,
-            note: 'Contact and job data had no accountId, retrieved from campaign creator',
+            note: 'Contact and job data had no tenantId, retrieved from campaign creator',
           });
         }
       } catch (error: any) {
-        logger.warn('[CAMPAIGN_QUEUE] Failed to get accountId from campaign creator', {
+        logger.warn('[CAMPAIGN_QUEUE] Failed to get tenantId from campaign creator', {
           error: error.message,
           campaignId,
           createdBy: campaign.created_by,
@@ -189,33 +190,33 @@ campaignQueue.process('campaign-message', 1, async (job) => {
       }
     }
 
-    if (!effectiveAccountId) {
-      logger.warn('[CAMPAIGN_QUEUE] No accountId available - agent will not have CRM context', {
+    if (!effectiveTenantId) {
+      logger.warn('[CAMPAIGN_QUEUE] No tenantId available - agent will not have CRM context', {
         campaignId,
         contactId,
         channel,
-        contactHasAccountId: !!contact.account_id,
+        contactHasTenantId: !!contact.tenant_id,
         campaignCreatedBy: campaign.created_by || 'none',
-        note: 'Contact has no account_id, job data has no accountId, and campaign creator lookup failed - agent responses will be generic',
+        note: 'Contact has no tenant_id, job data has no accountId (tenantId), and campaign creator lookup failed - agent responses will be generic',
       });
-    } else if (!accountId && contact.account_id) {
-      logger.info('[CAMPAIGN_QUEUE] Using accountId from contact', {
-        accountId: effectiveAccountId,
+    } else if (!accountId && contact.tenant_id) {
+      logger.info('[CAMPAIGN_QUEUE] Using tenantId from contact', {
+        tenantId: effectiveTenantId,
         contactId,
         channel,
-        note: 'accountId was missing from job data, retrieved from contact.account_id',
+        note: 'accountId (tenantId) was missing from job data, retrieved from contact.tenant_id',
       });
     }
 
     let webhookToken: { id: string; token: string } | null = null;
     let replyToEmail: string | undefined;
 
-    // Generate webhook token for inbound replies (if account ID is available)
-    if (effectiveAccountId && (channel === 'email' || channel === 'sms')) {
+    // Generate webhook token for inbound replies (if tenant ID is available)
+    if (effectiveTenantId && (channel === 'email' || channel === 'sms')) {
       try {
         const tokenType = channel === 'email' ? 'email' : 'sms';
         const token = await createWebhookToken({
-          account_id: effectiveAccountId,
+          account_id: effectiveTenantId, // Note: webhookTokens uses account_id which now represents tenant_id
           campaign_id: campaignId,
           contact_id: contactId,
           type: tokenType,
@@ -301,23 +302,23 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           // For OpenAI, use a placeholder agent ID
           agentId = `openai-survey-${survey.id.substring(0, 8)}`;
           logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode for survey call', {
-            accountId: effectiveAccountId || 'no-account',
+            tenantId: effectiveTenantId || 'no-tenant',
             surveyId: survey.id,
           });
-        } else if (effectiveAccountId) {
+        } else if (effectiveTenantId) {
           try {
             const agentConfig = await queryOne<{ agent_id: string }>(
               `SELECT agent_id FROM ai_agent_configurations 
-               WHERE account_id = $1 AND is_active = true 
+               WHERE tenant_id = $1 AND is_active = true 
                LIMIT 1`,
-              [effectiveAccountId]
+              [effectiveTenantId]
             );
             if (agentConfig) {
               agentId = agentConfig.agent_id;
             }
           } catch (error: any) {
             logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config for survey call, using simple TTS', {
-              accountId: effectiveAccountId,
+              tenantId: effectiveTenantId,
               error: error.message,
             });
           }
@@ -336,7 +337,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           undefined, // voiceId
           agentId,
           contactId,
-          effectiveAccountId || undefined, // Pass effectiveAccountId to voice call
+          effectiveTenantId || undefined, // Pass effectiveTenantId to voice call
           useAgent
         );
 
@@ -366,7 +367,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           campaign.name, // Use campaign name as subject
           campaign.instructions,
           contactId,
-          effectiveAccountId || undefined,
+          effectiveTenantId || undefined, // tenantId for CRM context
           campaignId,
           replyToEmail,
           customIntroduction
@@ -393,7 +394,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           contact.mobile,
           campaign.instructions,
           contactId,
-          effectiveAccountId || undefined,
+          effectiveTenantId || undefined, // tenantId for CRM context
           campaignId,
           customIntroduction
         );
@@ -412,7 +413,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
         logger.info('[CAMPAIGN_QUEUE] Processing call campaign', {
           campaignId: campaign.id,
           contactId: contact.id,
-          accountId: effectiveAccountId,
+          tenantId: effectiveTenantId,
           mobile: contact.mobile,
         });
 
@@ -426,34 +427,34 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           // The actual agent logic is handled by agentService which uses OpenAI Chat API
           agentId = `openai-${campaign.id.substring(0, 8)}`; // Placeholder agent ID
           logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode', {
-            accountId: effectiveAccountId || 'no-account',
+            tenantId: effectiveTenantId || 'no-tenant',
             agentId: agentId.substring(0, 15) + '...',
             openAIModel: env.OPENAI_MODEL,
           });
-        } else if (effectiveAccountId) {
+        } else if (effectiveTenantId) {
           // Fallback: Try to get agent config from database (for ElevenLabs compatibility)
           try {
-            logger.debug('[CAMPAIGN_QUEUE] Looking up agent config from database', { accountId: effectiveAccountId });
+            logger.debug('[CAMPAIGN_QUEUE] Looking up agent config from database', { tenantId: effectiveTenantId });
             const agentConfig = await queryOne<{ agent_id: string }>(
               `SELECT agent_id FROM ai_agent_configurations 
-               WHERE account_id = $1 AND is_active = true 
+               WHERE tenant_id = $1 AND is_active = true 
                LIMIT 1`,
-              [effectiveAccountId]
+              [effectiveTenantId]
             );
             if (agentConfig) {
               agentId = agentConfig.agent_id;
               logger.info('[CAMPAIGN_QUEUE] Agent config found in database', {
-                accountId: effectiveAccountId,
+                tenantId: effectiveTenantId,
                 agentId: agentId.substring(0, 8) + '...',
               });
             } else {
               logger.info('[CAMPAIGN_QUEUE] No agent config found in database, will use simple TTS', {
-                accountId: effectiveAccountId,
+                tenantId: effectiveTenantId,
               });
             }
           } catch (error: any) {
             logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config from database, using simple TTS call', {
-              accountId: effectiveAccountId,
+              tenantId: effectiveTenantId,
               error: error.message,
             });
           }
@@ -502,7 +503,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
             undefined, // voiceId
             agentId,
             contactId,
-            effectiveAccountId || undefined, // Pass effectiveAccountId to voice call - ensures agent gets CRM context
+            effectiveTenantId || undefined, // Pass effectiveTenantId to voice call - ensures agent gets CRM context
             useAgent,
             customIntroduction,
             campaign.instructions // Pass campaign instructions for AI context
@@ -567,7 +568,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
     }
 
     const activityResult = await queryOne<{ id: string }>(
-      `INSERT INTO activities (type, subject, description, related_to_type, related_to_id, performed_by, metadata, account_id)
+      `INSERT INTO activities (type, subject, description, related_to_type, related_to_id, performed_by, metadata, tenant_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id`,
       [
@@ -578,7 +579,7 @@ campaignQueue.process('campaign-message', 1, async (job) => {
         contactId,
         userId,
         JSON.stringify(metadata),
-        contact.account_id,
+        effectiveTenantId, // Use effectiveTenantId instead of contact.account_id
       ]
     );
 

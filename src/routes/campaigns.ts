@@ -48,7 +48,7 @@ const createCampaignSchema = z.object({
   metadata: z.object({
     contact_group_ids: z.array(z.string().uuid()).optional(), // Primary method: select by groups
     contact_ids: z.array(z.string().uuid()).optional(), // Deprecated: backward compatibility
-    template_id: z.string().uuid().optional(), // Deprecated - kept for backward compatibility
+    // template_id removed - templates deprecated, use instructions field instead
     survey_id: z.string().uuid().optional(),
     days_inactive: z.number().optional(), // Optional: filter groups by dormancy
     channels: z.object({
@@ -644,13 +644,12 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     }
 
     const { id } = req.params;
-    const { contact_ids, template_id } = req.body;
+    const { contact_ids } = req.body;
 
     logger.info('[CAMPAIGN] Execute endpoint called', {
       campaignId: id,
       userId: req.user.userId,
       hasContactIds: !!contact_ids,
-      hasTemplateId: !!template_id,
     });
 
     // Validate UUID format
@@ -705,20 +704,6 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     // Check if campaign has instructions (required for AI-generated campaigns)
     if (!campaign.instructions || !campaign.instructions.trim()) {
       throw createError('Campaign instructions are required for execution', 400);
-    }
-
-    // Get template (for backward compatibility with old campaigns)
-    let template: any = null;
-    if (template_id) {
-      template = await queryOne('SELECT * FROM templates WHERE id = $1', [template_id]);
-      if (!template) {
-        throw createError('Template not found', 404);
-      }
-    } else {
-      // Try to get template from campaign metadata
-      if (metadata?.template_id) {
-        template = await queryOne('SELECT * FROM templates WHERE id = $1', [metadata.template_id]);
-      }
     }
 
     // Check if survey is specified in metadata (for backward compatibility)
@@ -951,10 +936,10 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     // Collect all job promises first (parallel queuing)
     const jobPromises: Promise<any>[] = [];
 
-    // Prepare template variables for all contacts
+    // Prepare contact variables for AI personalization
     for (const contact of contacts) {
       try {
-        // Prepare template variables
+        // Prepare contact variables for AI personalization
         const variables: Record<string, string> = {
           first_name: contact.first_name || '',
           last_name: contact.last_name || '',
@@ -1017,9 +1002,6 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
             accountId: userCompanyId || undefined,
           };
 
-          if (template) {
-            jobData.templateId = template.id;
-          }
           if (survey) {
             jobData.surveyId = survey.id;
           }

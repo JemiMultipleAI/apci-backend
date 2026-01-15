@@ -32,12 +32,12 @@ router.get('/', authenticate, enrichUser, async (req: Request, res: Response, ne
     const params: any[] = [];
     let paramIndex = 1;
 
-    // Apply company filtering for non-super_admin users
+    // Apply tenant filtering for non-super_admin users
     if (!isSuperAdmin(req.user)) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (userCompanyId) {
-        whereClause += ` AND cg.account_id = $${paramIndex}`;
-        params.push(userCompanyId);
+      const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (userTenantId) {
+        whereClause += ` AND cg.tenant_id = $${paramIndex}`;
+        params.push(userTenantId);
         paramIndex++;
       }
     }
@@ -108,10 +108,10 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       return next(createError('Contact group not found', 404));
     }
 
-    // Check company access for non-super_admin users
+    // Check tenant access for non-super_admin users
     if (!isSuperAdmin(req.user)) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (userCompanyId && group.account_id !== userCompanyId) {
+      const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (userTenantId && group.tenant_id !== userTenantId) {
         return next(createError('Access denied', 403));
       }
     }
@@ -144,13 +144,13 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
     }
 
     const result = await queryOne(
-      `INSERT INTO contact_groups (name, description, account_id, created_by)
+      `INSERT INTO contact_groups (name, description, tenant_id, created_by)
        VALUES ($1, $2, $3, $4)
        RETURNING *`,
       [
         validatedData.name,
         validatedData.description || null,
-        userCompanyId,
+        userCompanyId, // This is tenant_id now (userCompanyId is kept for backward compat but represents tenant_id)
         userId || null,
       ]
     );
@@ -183,10 +183,10 @@ router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       return next(createError('Contact group not found', 404));
     }
 
-    // Check company access for non-super_admin users
+    // Check tenant access for non-super_admin users
     if (!isSuperAdmin(req.user)) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (userCompanyId && existingGroup.account_id !== userCompanyId) {
+      const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (userTenantId && existingGroup.tenant_id !== userTenantId) {
         return next(createError('Access denied', 403));
       }
     }
@@ -245,10 +245,10 @@ router.delete('/:id', authenticate, enrichUser, async (req: Request, res: Respon
       return next(createError('Contact group not found', 404));
     }
 
-    // Check company access for non-super_admin users
+    // Check tenant access for non-super_admin users
     if (!isSuperAdmin(req.user)) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (userCompanyId && existingGroup.account_id !== userCompanyId) {
+      const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (userTenantId && existingGroup.tenant_id !== userTenantId) {
         return next(createError('Access denied', 403));
       }
     }
@@ -393,10 +393,10 @@ router.get('/:id/contacts', authenticate, enrichUser, async (req: Request, res: 
       return next(createError('Contact group not found', 404));
     }
 
-    // Check company access for non-super_admin users
+    // Check tenant access for non-super_admin users
     if (!isSuperAdmin(req.user)) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (userCompanyId && existingGroup.account_id !== userCompanyId) {
+      const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (userTenantId && existingGroup.tenant_id !== userTenantId) {
         return next(createError('Access denied', 403));
       }
     }
@@ -455,10 +455,10 @@ router.post('/:id/contacts', authenticate, enrichUser, async (req: Request, res:
       return next(createError('Contact group not found', 404));
     }
 
-    // Check company access for non-super_admin users
+    // Check tenant access for non-super_admin users
     if (!isSuperAdmin(req.user)) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (userCompanyId && existingGroup.account_id !== userCompanyId) {
+      const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (userTenantId && existingGroup.tenant_id !== userTenantId) {
         return next(createError('Access denied', 403));
       }
     }
@@ -505,10 +505,10 @@ router.delete('/:id/contacts/:contactId', authenticate, enrichUser, async (req: 
       return next(createError('Contact group not found', 404));
     }
 
-    // Check company access for non-super_admin users
+    // Check tenant access for non-super_admin users
     if (!isSuperAdmin(req.user)) {
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (userCompanyId && existingGroup.account_id !== userCompanyId) {
+      const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (userTenantId && existingGroup.tenant_id !== userTenantId) {
         return next(createError('Access denied', 403));
       }
     }

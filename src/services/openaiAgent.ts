@@ -238,17 +238,32 @@ Guidelines:
   let companyName: string | null = null;
   if (accountId) {
     try {
-      const account = await queryOne<{ name: string }>(
-        'SELECT name FROM accounts WHERE id = $1',
+      // Try customer_companies first (for customer company name)
+      const customerCompany = await queryOne<{ name: string }>(
+        'SELECT name FROM customer_companies WHERE id = $1',
         [accountId]
       );
-      if (account?.name) {
-        companyName = account.name;
+      if (customerCompany?.name) {
+        companyName = customerCompany.name;
         prompt += `\n\nCompany Information:\n- Company Name: ${companyName}\n`;
-        logger.debug('[OPENAI] Company information loaded', {
+        logger.debug('[OPENAI] Customer company information loaded', {
           accountId,
           companyName,
         });
+      } else {
+        // Fallback to tenant_companies (for tenant company name)
+        const tenantCompany = await queryOne<{ name: string }>(
+          'SELECT name FROM tenant_companies WHERE id = $1',
+          [accountId]
+        );
+        if (tenantCompany?.name) {
+          companyName = tenantCompany.name;
+          prompt += `\n\nCompany Information:\n- Company Name: ${companyName}\n`;
+          logger.debug('[OPENAI] Tenant company information loaded', {
+            accountId,
+            companyName,
+          });
+        }
       }
     } catch (error: any) {
       logger.warn('[OPENAI] Failed to load company information', {
@@ -321,9 +336,9 @@ Guidelines:
         mobile: string | null;
         lifecycle_stage: string | null;
       }>(
-        `SELECT first_name, last_name, email, mobile, lifecycle_stage 
-         FROM contacts 
-         WHERE id = $1 AND account_id = $2`,
+        `SELECT first_name, last_name, email, mobile, lifecycle_stage
+         FROM contacts
+         WHERE id = $1 AND tenant_id = $2`,
         [contactId, accountId]
       );
 

@@ -182,8 +182,8 @@ app.use('/api/campaign-analytics', campaignAnalyticsRouter);
 app.use('/api/inbox', inboxRouter);
 app.use('/api/calls', callsRouter);
 
-// Templates
-app.use('/api/templates', templatesRouter);
+// Templates (DEPRECATED - returns 410 Gone)
+// app.use('/api/templates', templatesRouter); // Commented out - templates feature deprecated
 
 // Import/Export
 app.use('/api/import-export', importExportRouter);

@@ -10,36 +10,37 @@ export function isSuperAdmin(user: TokenPayload | { role?: string }): boolean {
 }
 
 /**
- * Get user's company ID from database
+ * Get user's tenant ID from database
  * Note: This should be cached in request context (req.userCompanyId) to avoid repeated queries
+ * Note: req.userCompanyId is kept for backward compatibility but now represents tenant_id
  */
 export async function getUserCompanyId(user: TokenPayload): Promise<string | null> {
   try {
-    const result = await queryOne<{ account_id: string | null }>(
-      'SELECT account_id FROM users WHERE id = $1',
+    const result = await queryOne<{ tenant_id: string | null }>(
+      'SELECT tenant_id FROM users WHERE id = $1',
       [user.userId]
     );
-    return result?.account_id || null;
+    return result?.tenant_id || null;
   } catch (error) {
-    logger.error('Failed to get user company ID:', error);
+    logger.error('Failed to get user tenant ID:', error);
     return null;
   }
 }
 
 /**
- * Check if user has access to a specific company
+ * Check if user has access to a specific tenant
  */
-export async function hasCompanyAccess(user: TokenPayload, accountId: string): Promise<boolean> {
-  // Super_admin has access to all companies
+export async function hasCompanyAccess(user: TokenPayload, tenantId: string): Promise<boolean> {
+  // Super_admin has access to all tenants
   if (isSuperAdmin(user)) {
     return true;
   }
 
-  // Get user's company ID
-  const userCompanyId = await getUserCompanyId(user);
+  // Get user's tenant ID
+  const userTenantId = await getUserCompanyId(user);
   
-  // User can only access their own company
-  return userCompanyId === accountId;
+  // User can only access their own tenant
+  return userTenantId === tenantId;
 }
 
 /**
@@ -76,12 +77,14 @@ export async function getEffectiveCompanyId(
 }
 
 /**
- * Build WHERE clause for company filtering
+ * Build WHERE clause for tenant filtering
+ * @param tenantColumn - Column name to filter on (default: 'tenant_id', can be 'customer_company_id' for customer relationships)
  */
 export async function buildCompanyFilter(
   user: TokenPayload,
   providedCompanyId?: string,
-  tableAlias: string = ''
+  tableAlias: string = '',
+  tenantColumn: string = 'tenant_id'
 ): Promise<{ clause: string; value: string | null }> {
   const effectiveCompanyId = await getEffectiveCompanyId(user, providedCompanyId);
   
@@ -90,7 +93,7 @@ export async function buildCompanyFilter(
     return { clause: '', value: null };
   }
 
-  const column = tableAlias ? `${tableAlias}.account_id` : 'account_id';
+  const column = tableAlias ? `${tableAlias}.${tenantColumn}` : tenantColumn;
   return { clause: `AND ${column} = $1`, value: effectiveCompanyId };
 }
 

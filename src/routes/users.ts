@@ -15,7 +15,7 @@ interface UserQueryResult {
   last_name: string | null;
   role: string;
   is_active: boolean;
-  account_id: string | null;
+  tenant_id: string | null; // Updated: account_id → tenant_id
   created_at: Date;
   updated_at: Date;
 }
@@ -29,7 +29,7 @@ const createUserSchema = z.object({
   last_name: z.string().optional(),
   role: z.enum(['super_admin', 'admin', 'manager', 'sales_rep', 'viewer']).optional(),
   is_active: z.boolean().optional(),
-  account_id: z.string().uuid().optional().nullable(),
+  tenant_id: z.string().uuid().optional().nullable(), // Updated: account_id → tenant_id
 });
 
 const updateUserSchema = z.object({
@@ -37,7 +37,7 @@ const updateUserSchema = z.object({
   last_name: z.string().optional(),
   role: z.enum(['super_admin', 'admin', 'manager', 'sales_rep', 'viewer']).optional(),
   is_active: z.boolean().optional(),
-  account_id: z.string().uuid().optional().nullable(),
+  tenant_id: z.string().uuid().optional().nullable(), // Updated: account_id → tenant_id
 });
 
 // GET /api/users - List all users (admin/manager/super_admin only)
@@ -74,7 +74,7 @@ router.get('/', authenticate, enrichUser, authorize('super_admin', 'admin', 'man
     }
 
     const users = await query<UserQueryResult>(
-      `SELECT id, email, first_name, last_name, role, is_active, account_id, created_at, updated_at
+      `SELECT id, email, first_name, last_name, role, is_active, tenant_id, created_at, updated_at
        FROM users ${whereClause} 
        ORDER BY created_at DESC 
        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
@@ -92,7 +92,7 @@ router.get('/', authenticate, enrichUser, authorize('super_admin', 'admin', 'man
       success: true,
       data: users.map((user) => ({
         ...user,
-        company_id: user.account_id || null,
+        company_id: user.tenant_id || null, // Keep company_id for backward compatibility
       })),
       pagination: {
         page: parseInt(page as string),
@@ -115,16 +115,16 @@ router.post('/', authenticate, authorize('super_admin'), async (req: Request, re
 
     const validatedData = createUserSchema.parse(req.body);
 
-    // Validate company assignment
+    // Validate tenant assignment
     if (validatedData.role === 'super_admin') {
-      // Super_admin cannot have a company
-      if (validatedData.account_id !== null && validatedData.account_id !== undefined) {
-        throw createError('Super admin cannot be assigned to a company', 400);
+      // Super_admin cannot have a tenant
+      if (validatedData.tenant_id !== null && validatedData.tenant_id !== undefined) {
+        throw createError('Super admin cannot be assigned to a tenant', 400);
       }
     } else {
-      // Non-super_admin roles must have a company
-      if (!validatedData.account_id) {
-        throw createError('Company assignment is required for non-super_admin roles', 400);
+      // Non-super_admin roles must have a tenant
+      if (!validatedData.tenant_id) {
+        throw createError('Tenant assignment is required for non-super_admin roles', 400);
       }
     }
 
@@ -142,19 +142,19 @@ router.post('/', authenticate, authorize('super_admin'), async (req: Request, re
     // Hash password
     const passwordHash = await bcrypt.hash(validatedData.password, 10);
 
-    // Validate UUID format for account_id if provided
-    if (validatedData.account_id) {
+    // Validate UUID format for tenant_id if provided
+    if (validatedData.tenant_id) {
       const uuidSchema = z.string().uuid();
-      if (!uuidSchema.safeParse(validatedData.account_id).success) {
-        throw createError('Invalid company ID format', 400);
+      if (!uuidSchema.safeParse(validatedData.tenant_id).success) {
+        throw createError('Invalid tenant ID format', 400);
       }
     }
 
     // Create user
     const user = await queryOne<UserQueryResult>(
-      `INSERT INTO users (email, password_hash, first_name, last_name, role, is_active, account_id)
+      `INSERT INTO users (email, password_hash, first_name, last_name, role, is_active, tenant_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, email, first_name, last_name, role, is_active, account_id, created_at, updated_at`,
+       RETURNING id, email, first_name, last_name, role, is_active, tenant_id, created_at, updated_at`,
       [
         validatedData.email,
         passwordHash,
@@ -162,7 +162,7 @@ router.post('/', authenticate, authorize('super_admin'), async (req: Request, re
         validatedData.last_name || null,
         validatedData.role || 'viewer',
         validatedData.is_active !== undefined ? validatedData.is_active : true,
-        validatedData.account_id || null,
+        validatedData.tenant_id || null,
       ]
     );
 
@@ -174,7 +174,7 @@ router.post('/', authenticate, authorize('super_admin'), async (req: Request, re
       success: true,
       data: {
         ...user,
-        company_id: user.account_id || null,
+        company_id: user.tenant_id || null, // Keep company_id for backward compatibility
       },
     });
   } catch (error) {
@@ -202,7 +202,7 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
     }
 
     const user = await queryOne<UserQueryResult>(
-      'SELECT id, email, first_name, last_name, role, is_active, account_id, created_at, updated_at FROM users WHERE id = $1',
+      'SELECT id, email, first_name, last_name, role, is_active, tenant_id, created_at, updated_at FROM users WHERE id = $1',
       [id]
     );
 
@@ -211,12 +211,12 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
     }
 
     // Users can view their own profile, or if they're super_admin/admin/manager
-    // For non-super_admin, check company access
+    // For non-super_admin, check tenant access
     if (id !== currentUserId && !isSuperAdmin(req.user)) {
-      // Check if user has access to view this employee (same company)
-      const userCompanyId = req.userCompanyId ?? await getUserCompanyId(req.user);
-      if (user.account_id && userCompanyId !== user.account_id) {
-        logger.warn('User access denied', { userId: req.user.userId, requestedUserId: id, requestedUserCompanyId: user.account_id, userCompanyId });
+      // Check if user has access to view this employee (same tenant)
+      const userTenantId = req.userCompanyId ?? await getUserCompanyId(req.user);
+      if (user.tenant_id && userTenantId !== user.tenant_id) {
+        logger.warn('User access denied', { userId: req.user.userId, requestedUserId: id, requestedUserTenantId: user.tenant_id, userTenantId });
         throw createError('Forbidden: You do not have access to this user', 403);
       }
     }
@@ -225,7 +225,7 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       success: true,
       data: {
         ...user,
-        company_id: user.account_id || null,
+        company_id: user.tenant_id || null, // Keep company_id for backward compatibility
       },
     });
   } catch (error) {
@@ -250,36 +250,36 @@ router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       throw createError('Invalid user ID format', 400);
     }
     
-    // Validate UUID format for account_id if provided
-    if (validatedData.account_id) {
-      if (!uuidSchema.safeParse(validatedData.account_id).success) {
-        throw createError('Invalid company ID format', 400);
+    // Validate UUID format for tenant_id if provided
+    if (validatedData.tenant_id) {
+      if (!uuidSchema.safeParse(validatedData.tenant_id).success) {
+        throw createError('Invalid tenant ID format', 400);
       }
     }
 
-    // Users can only update their own profile (except role/is_active/account_id), unless they're super_admin
+    // Users can only update their own profile (except role/is_active/tenant_id), unless they're super_admin
     if (id !== currentUserId && !isSuperAdmin(req.user)) {
       throw createError('Forbidden', 403);
     }
 
-    // Only super_admin can change role, is_active, and account_id
-    if ((validatedData.role !== undefined || validatedData.is_active !== undefined || validatedData.account_id !== undefined) && !isSuperAdmin(req.user)) {
-      throw createError('Only super_admin can change role, active status, or company assignment', 403);
+    // Only super_admin can change role, is_active, and tenant_id
+    if ((validatedData.role !== undefined || validatedData.is_active !== undefined || validatedData.tenant_id !== undefined) && !isSuperAdmin(req.user)) {
+      throw createError('Only super_admin can change role, active status, or tenant assignment', 403);
     }
 
-    // Validate company assignment if role is being changed
+    // Validate tenant assignment if role is being changed
     if (validatedData.role !== undefined) {
       if (validatedData.role === 'super_admin') {
-        // Super_admin cannot have a company
-        if (validatedData.account_id !== null && validatedData.account_id !== undefined) {
-          throw createError('Super admin cannot be assigned to a company', 400);
+        // Super_admin cannot have a tenant
+        if (validatedData.tenant_id !== null && validatedData.tenant_id !== undefined) {
+          throw createError('Super admin cannot be assigned to a tenant', 400);
         }
       } else {
-        // Non-super_admin roles must have a company
-        const existing = await queryOne('SELECT account_id FROM users WHERE id = $1', [id]);
-        const finalAccountId = validatedData.account_id !== undefined ? validatedData.account_id : existing?.account_id;
-        if (!finalAccountId) {
-          throw createError('Company assignment is required for non-super_admin roles', 400);
+        // Non-super_admin roles must have a tenant
+        const existing = await queryOne<{ tenant_id: string | null }>('SELECT tenant_id FROM users WHERE id = $1', [id]);
+        const finalTenantId = validatedData.tenant_id !== undefined ? validatedData.tenant_id : existing?.tenant_id;
+        if (!finalTenantId) {
+          throw createError('Tenant assignment is required for non-super_admin roles', 400);
         }
       }
     }
@@ -299,8 +299,8 @@ router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response,
     let paramIndex = 1;
 
     Object.entries(validatedData).forEach(([key, value]) => {
-      if (key === 'account_id') {
-        updates.push(`account_id = $${paramIndex}`);
+      if (key === 'tenant_id') {
+        updates.push(`tenant_id = $${paramIndex}`);
         values.push(value);
       } else {
         updates.push(`${key} = $${paramIndex}`);
@@ -315,7 +315,7 @@ router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response,
 
     values.push(id);
     const result = await queryOne<UserQueryResult>(
-      `UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIndex} RETURNING id, email, first_name, last_name, role, is_active, account_id, created_at, updated_at`,
+      `UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIndex} RETURNING id, email, first_name, last_name, role, is_active, tenant_id, created_at, updated_at`,
       values
     );
 
@@ -327,7 +327,7 @@ router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       success: true,
       data: {
         ...result,
-        company_id: result.account_id || null,
+        company_id: result.tenant_id || null, // Keep company_id for backward compatibility
       },
     });
   } catch (error) {
