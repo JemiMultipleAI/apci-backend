@@ -177,6 +177,16 @@ export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCal
         }
         if (options.accountId) {
           customParams.account_id = options.accountId;
+          logger.debug('[VOICE] Added account_id to custom parameters', {
+            accountId: options.accountId,
+            customParamsKeys: Object.keys(customParams),
+          });
+        } else {
+          logger.warn('[VOICE] No accountId provided - agent will NOT have CRM context', {
+            hasContactId: !!options.contactId,
+            hasAgentId: !!options.agentId,
+            note: 'AI responses will be generic without campaigns, deals, or contact context',
+          });
         }
         if (options.customIntroduction) {
           customParams.customIntroduction = options.customIntroduction;

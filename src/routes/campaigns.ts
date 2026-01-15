@@ -845,8 +845,33 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     const userId = req.user?.userId;
     // metadata is already declared at the top of this function
 
-    // Get user's company ID for webhook token creation
-    const userCompanyId = req.userCompanyId ?? (req.user ? await getUserCompanyId(req.user) : null);
+    // Get user's company ID for webhook token creation and job data
+    let userCompanyId = req.userCompanyId ?? (req.user ? await getUserCompanyId(req.user) : null);
+
+    // Fallback: If user doesn't have account_id, try to get it from campaign creator
+    if (!userCompanyId && campaign.created_by) {
+      try {
+        const creator = await queryOne<{ account_id: string | null }>(
+          'SELECT account_id FROM users WHERE id = $1',
+          [campaign.created_by]
+        );
+        if (creator?.account_id) {
+          userCompanyId = creator.account_id;
+          logger.info('[CAMPAIGN] Using accountId from campaign creator for job data', {
+            accountId: userCompanyId,
+            campaignId: campaign.id,
+            createdBy: campaign.created_by,
+            note: 'User executing campaign has no account_id, using campaign creator\'s account_id',
+          });
+        }
+      } catch (error: any) {
+        logger.warn('[CAMPAIGN] Failed to get accountId from campaign creator for job data', {
+          error: error.message,
+          campaignId: campaign.id,
+          createdBy: campaign.created_by,
+        });
+      }
+    }
 
     // Get channel configuration from metadata or use legacy channel field
     let channels: {

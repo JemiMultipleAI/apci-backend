@@ -137,21 +137,38 @@ router.post('/chat', authenticate, enrichUser, async (req: Request, res: Respons
     }
 
     // Use provided accountId or user's company ID
-    const effectiveAccountId = accountId || req.userCompanyId || null;
-    
-    // Log accountId availability for debugging
-    if (!effectiveAccountId) {
-      logger.warn('[AI_CHAT] No accountId available - CRM data will not be loaded', {
-        userId: req.user?.userId,
-        hasUserCompanyId: !!req.userCompanyId,
-        hasAccountId: !!accountId,
-      });
+    // Try to get it from multiple sources
+    let effectiveAccountId: string | undefined;
+    if (accountId) {
+      effectiveAccountId = accountId;
+    } else if (req.userCompanyId) {
+      effectiveAccountId = req.userCompanyId;
     } else {
-      logger.debug('[AI_CHAT] Using accountId for CRM context', {
-        accountId: effectiveAccountId,
-        hasContactId: !!contactId,
-      });
+      // Try to get it from the user if not already set
+      if (req.user) {
+        const { getUserCompanyId } = await import('../utils/companyAccess');
+        const userCompanyId = await getUserCompanyId(req.user);
+        effectiveAccountId = userCompanyId || undefined;
+        
+        // Cache it for future requests
+        if (userCompanyId) {
+          req.userCompanyId = userCompanyId;
+        }
+      }
     }
+
+    // Log what we're using for debugging
+    logger.info('[AI_CHAT] Chatbot request', {
+      hasMessage: !!message,
+      providedAccountId: accountId || 'none',
+      providedContactId: contactId || 'none',
+      userCompanyId: req.userCompanyId || 'none',
+      effectiveAccountId: effectiveAccountId || 'none',
+      userId: req.user?.userId,
+      note: effectiveAccountId 
+        ? '✅ accountId available - agent will have CRM context'
+        : '❌ No accountId - agent will NOT have CRM context',
+    });
 
     // Generate or use provided conversation ID
     let currentConversationId = conversationId;
