@@ -1,8 +1,7 @@
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import twilio from 'twilio';
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { ElevenLabsClient } = require('elevenlabs');
+import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
 
 export interface VoiceCallOptions {
   to: string;
@@ -55,7 +54,7 @@ const generateAudioFromText = async (
 
   const audio = await client.textToSpeech.convert(voiceId, {
     text,
-    model_id: 'eleven_monolingual_v1',
+    modelId: 'eleven_monolingual_v1',
   });
 
   // Convert stream to buffer

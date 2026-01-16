@@ -3,8 +3,7 @@ import { env } from '../config/env';
 import OpenAI from 'openai';
 import { PassThrough } from 'stream';
 import ffmpeg from 'fluent-ffmpeg';
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { ElevenLabsClient } = require('elevenlabs');
+import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
 
 // Set FFmpeg path from installer package (if available)
 try {
@@ -91,12 +90,15 @@ function createOpenAIStream(
     let lastRealAudioTime = Date.now(); // Track when we last received a "real" audio chunk (> 10 bytes)
     let isProcessing = false;
     let lastTranscriptTime = 0;
-    const BUFFER_INTERVAL_MS = 3000; // Check every 3 seconds
-    const MIN_AUDIO_BYTES = 8000; // Minimum ~1 second at 8kHz μ-law (~8000 bytes)
-    const MIN_AUDIO_LENGTH_MS = 1500; // Minimum 1.5 seconds of audio before transcribing (increased for better sentence completion)
-    const MAX_AUDIO_LENGTH_MS = 12000; // Maximum 12 seconds before forcing process (for long speech - increased)
-    const SILENCE_DETECTION_MS = 2500; // If no new audio for 2.5 seconds, process (they stopped talking - increased for complete sentences)
-    const MIN_REASONABLE_AUDIO = 4000; // Minimum ~500ms at 8kHz (need at least half a second for meaningful transcription)
+    let lastProcessedBufferHash: string | null = null; // Track last processed buffer to prevent duplicates
+    let lastProcessedTranscriptText: string | null = null; // Track last processed transcript text to prevent duplicates
+    let lastProcessedTranscriptTime: number = 0; // Track when we last processed a transcript
+    const BUFFER_INTERVAL_MS = 500; // Check every 0.5 seconds (aggressive - 75% reduction for 50% latency cut)
+    const MIN_AUDIO_BYTES = 1200; // Reduced from 2000 - allow very short phrases (~0.15s at 8kHz μ-law)
+    const MIN_AUDIO_LENGTH_MS = 200; // Reduced from 400ms - capture very short phrases faster
+    const MAX_AUDIO_LENGTH_MS = 8000; // Maximum 8 seconds before forcing process (reduced from 10s)
+    const SILENCE_DETECTION_MS = 300; // Reduced from 600ms - much faster response to user pauses
+    const MIN_REASONABLE_AUDIO = 600; // Reduced from 1000 - allow very short audio (~0.075s)
     const MIN_CHUNK_SIZE_FOR_REAL_AUDIO = 10; // Chunks smaller than this are likely silence
     let bufferTimer: NodeJS.Timeout | null = null;
     let silenceDetectionTimer: NodeJS.Timeout | null = null;
@@ -163,8 +165,10 @@ function createOpenAIStream(
         : 0;
       const isLikelySilence = avgChunkSize < MIN_CHUNK_SIZE_FOR_REAL_AUDIO; // If average chunk < 10 bytes, it's silence
       
-      // Only allow forced processing for stream-end (not silence or max-time if buffer is too small)
-      const isLegitimateForceReason = forceReason === 'stream-ended';
+      // Allow forced processing for stream-end and pause-based triggers
+      const isLegitimateForceReason = forceReason === 'stream-ended' || 
+        forceReason === 'audio-with-pause' || 
+        forceReason === 'substantial-audio-with-pause';
       
       // Don't process if chunks are too small (silence)
       if (isLikelySilence && totalBufferSize < MIN_AUDIO_BYTES) {
@@ -178,14 +182,17 @@ function createOpenAIStream(
         return;
       }
       
-      // Don't process if too small (unless we have substantial audio)
-      if (!hasMinSize && !hasReasonableAudio && !isLegitimateForceReason && (!hasMaxTime || !hasReasonableAudio) && (!hasSilence || !hasReasonableAudio)) {
+      // Don't process if too small (unless we have reasonable audio OR force processing)
+      // Simplified condition: process if we have min size, reasonable audio, force reason, max time, or silence
+      if (!hasMinSize && !hasReasonableAudio && !isLegitimateForceReason && 
+          !hasMaxTime && !hasSilence) {
         scheduleProcessing();
         return;
       }
       
       // If max-time or silence reached but audio is still too small, reset and continue waiting
-      if ((hasMaxTime || hasSilence) && !hasReasonableAudio) {
+      // BUT: Don't reset if we have reasonable audio (might be a short phrase) OR force processing
+      if ((hasMaxTime || hasSilence) && !hasReasonableAudio && !isLegitimateForceReason) {
         audioBuffer = [];
         bufferStartTime = Date.now();
         lastAudioReceivedTime = Date.now();
@@ -194,7 +201,8 @@ function createOpenAIStream(
         return;
       }
       
-      // Skip if still way too small (unless stream ended)
+      // Skip if still way too small (unless force processing or we have reasonable audio)
+      // Allow force processing even with smaller buffers (1000+ bytes)
       if (totalBufferSize < MIN_REASONABLE_AUDIO && !isLegitimateForceReason) {
         scheduleProcessing();
         return;
@@ -206,6 +214,25 @@ function createOpenAIStream(
       isProcessing = true;
       const chunksToProcess = [...audioBuffer];
       const bufferSizeBytes = totalBufferSize;
+      
+      // Create a hash of the buffer to detect duplicates
+      // This prevents processing the same audio multiple times
+      const bufferHash = chunksToProcess.map(b => b.length).join(',') + '-' + bufferSizeBytes;
+      if (lastProcessedBufferHash === bufferHash && !isLegitimateForceReason) {
+        logger.debug('[STT] Skipping duplicate buffer', {
+          bufferSize: bufferSizeBytes,
+          reason: 'Same buffer content already processed',
+          note: 'Preventing duplicate transcription of same audio',
+        });
+        // Reset processing flag and restore buffer
+        isProcessing = false;
+        audioBuffer = chunksToProcess;
+        bufferStartTime = Date.now() - originalBufferAge;
+        scheduleProcessing();
+        return;
+      }
+      
+      lastProcessedBufferHash = bufferHash;
       audioBuffer = [];
       bufferStartTime = Date.now();
       lastAudioReceivedTime = Date.now();
@@ -262,7 +289,63 @@ function createOpenAIStream(
         const transcriptText = transcript.text ? transcript.text.trim() : '';
         const hasText = transcriptText.length > 0;
 
+        // FILTER: Check if audio actually contains speech (not just noise/background sound)
+        // Whisper provides no_speech_prob - probability that audio has no speech
+        // If probability is high (>0.5), it's likely noise/background sound, not actual speech
+        const noSpeechProb = transcript.segments?.[0]?.no_speech_prob ?? 0.5;
+        const hasSpeech = noSpeechProb < 0.5; // If < 0.5, likely has speech
+        const confidence = 1 - noSpeechProb;
+
+        if (hasText && !hasSpeech) {
+          logger.debug('[STT] Filtered noise/background sound', {
+            text: transcriptText.substring(0, 50),
+            noSpeechProb: noSpeechProb.toFixed(3),
+            confidence: confidence.toFixed(3),
+            note: 'Audio likely contains noise/background sound, not actual speech - ignoring',
+          });
+          isProcessing = false;
+          scheduleProcessing();
+          return;
+        }
+
+        // FILTER: Check for duplicate transcript text (within 3 seconds) - prevents processing same audio multiple times
+        // Do this check BEFORE the hasText check so we can filter empty duplicates too
         if (hasText) {
+          const transcriptNow = Date.now();
+          const isDuplicateText = lastProcessedTranscriptText === transcriptText && 
+            (transcriptNow - lastProcessedTranscriptTime) < 3000; // 3-second window (safer than 5 seconds)
+          
+          if (isDuplicateText) {
+            logger.debug('[STT] Filtered duplicate transcript text', {
+              text: transcriptText.substring(0, 50),
+              timeSinceLastProcess: transcriptNow - lastProcessedTranscriptTime,
+              note: 'Same transcript text processed recently - skipping to prevent duplicate processing',
+            });
+            // Reset buffer hash to allow new audio
+            setTimeout(() => {
+              lastProcessedBufferHash = null;
+            }, 2000);
+            isProcessing = false;
+            scheduleProcessing();
+            return;
+          }
+        }
+
+        if (hasText) {
+          // FILTER: Only process if confidence is reasonable (filter low-confidence noise)
+          // Low confidence (< 0.3) often indicates background noise, unclear audio, or non-speech sounds
+          const MIN_CONFIDENCE = 0.3; // Minimum confidence to process transcript
+          if (confidence < MIN_CONFIDENCE) {
+            logger.debug('[STT] Filtered low-confidence transcript (likely noise)', {
+              text: transcriptText.substring(0, 50),
+              confidence: confidence.toFixed(3),
+              noSpeechProb: noSpeechProb.toFixed(3),
+              note: 'Confidence too low - likely noise, background sound, or unclear audio',
+            });
+            isProcessing = false;
+            scheduleProcessing();
+            return;
+          }
           // Quality check: if transcript is very short and doesn't end properly, might be incomplete
           const isVeryShort = transcriptText.length < 15;
           const endsWithPunctuation = /[.!?]$/.test(transcriptText);
@@ -316,12 +399,19 @@ function createOpenAIStream(
           onTranscript({
             text: transcriptText,
             isFinal: true,
-            confidence: transcript.segments?.[0]?.no_speech_prob !== undefined 
-              ? 1 - (transcript.segments[0].no_speech_prob || 0) 
-              : undefined,
+            confidence: confidence, // Use calculated confidence from no_speech_prob
           });
 
-          lastTranscriptTime = Date.now();
+          const transcriptNow = Date.now();
+          lastTranscriptTime = transcriptNow;
+          lastProcessedTranscriptText = transcriptText; // Track processed text
+          lastProcessedTranscriptTime = transcriptNow; // Track when processed
+          
+          // Reset buffer hash after successful processing to allow new audio
+          // Use a shorter delay to allow faster re-processing (75% reduction)
+          setTimeout(() => {
+            lastProcessedBufferHash = null;
+          }, 500);
         }
       } catch (error: any) {
         logger.error('[STT] OpenAI Whisper transcription failed', {
@@ -386,7 +476,7 @@ function createOpenAIStream(
           silenceDetectionTimer = null;
         }
         
-        // Schedule silence detection (if no audio for 2.5 seconds, process - waits for user to finish speaking)
+        // Schedule silence detection (waits for user to finish speaking)
         // This ensures we only transcribe after natural pauses, not mid-speech
         scheduleSilenceDetection();
         
@@ -395,16 +485,27 @@ function createOpenAIStream(
           scheduleProcessing();
         }
 
-        // REMOVED: Immediate processing triggers - these caused partial transcripts mid-speech
-        // Now we ONLY process on:
-        // 1. Silence detection (2500ms of no audio) - user has finished speaking
-        // 2. Max time (12 seconds) - very long speech, force process to avoid hanging
-        // This ensures complete sentences are captured, not mid-speech fragments
-        //
-        // OLD CODE (removed):
-        // - Immediate processing when buffer >= 8000 bytes AND age >= 1500ms
-        // - Immediate processing when buffer >= 16000 bytes AND age >= 2000ms
-        // These caused transcripts to appear while user was still talking
+        // OPTIMIZATION: Force process audio if user has paused (even for short phrases)
+        // This helps capture short phrases like "yes sure" that might not trigger silence detection
+        // More aggressive: process if we have ANY reasonable audio and user paused
+        if (audioBuffer.length > 0 && !isProcessing) {
+          const totalBufferSize = audioBuffer.reduce((sum, b) => sum + b.length, 0);
+          const bufferAge = Date.now() - bufferStartTime;
+          const timeSinceLastAudio = Date.now() - lastAudioReceivedTime;
+          
+          if (totalBufferSize >= 600 && // Reduced from 1000 - match MIN_REASONABLE_AUDIO (~0.075s)
+              bufferAge >= 200 && // Reduced from 300ms - faster processing
+              timeSinceLastAudio >= 250 && // Reduced from 400ms - faster response to pauses
+              !isProcessing) {
+            logger.debug('[STT] Force processing audio with pause', {
+              bufferSize: totalBufferSize,
+              bufferAge,
+              timeSinceLastAudio,
+              note: 'User paused - processing to capture short phrases like "yes sure"',
+            });
+            processBuffer('audio-with-pause');
+          }
+        }
       },
       end: () => {
         // Process any remaining audio when stream ends
@@ -442,6 +543,8 @@ function createOpenAIStream(
         bufferStartTime = Date.now();
         lastAudioReceivedTime = Date.now();
         lastRealAudioTime = Date.now();
+        lastProcessedBufferHash = null; // Reset hash tracking
+        lastProcessedTranscriptText = null; // Reset transcript tracking
         if (bufferTimer) {
           clearTimeout(bufferTimer);
           bufferTimer = null;
@@ -464,7 +567,7 @@ function createOpenAIStream(
 /**
  * Create ElevenLabs streaming STT connection (Scribe v2 Realtime)
  */
-function createElevenLabsStream(
+export function createElevenLabsStream(
   onTranscript: (result: STTResult) => void,
   language: string
 ): STTStream | null {

@@ -85,6 +85,9 @@ const envSchema = z.object({
 
   // Knowledge Base
   KNOWLEDGE_BASE_SECRET: z.string().default('change-me-in-production-min-32-chars'),
+
+  // Voice Bridge Mode
+  VOICE_BRIDGE_MODE: z.enum(['standard', 'optimized']).default('standard'),
 });
 
 // Parse and validate environment variables

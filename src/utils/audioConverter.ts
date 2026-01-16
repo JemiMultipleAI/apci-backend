@@ -139,7 +139,7 @@ export async function convertMp3ToUlaw(mp3Buffer: Buffer): Promise<Buffer> {
       .audioCodec('pcm_mulaw') // μ-law codec
       .audioFrequency(8000) // 8kHz sample rate
       .audioChannels(1) // Mono
-      .format('mulaw') // Raw μ-law format (no container, just raw bytes)
+      .outputFormat('mulaw') // Raw μ-law format (no container)
       .on('start', (commandLine) => {
         logger.debug('[AUDIO_CONVERTER] FFmpeg conversion started', {
           command: commandLine,

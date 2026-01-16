@@ -172,8 +172,11 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
               });
               
               if (agentId) {
-                // Trigger bridge connection
-                import('./voiceCallBridge').then(({ startVoiceCallBridge }) => {
+                // Trigger bridge connection (switchable between standard and optimized)
+                const bridgeModule = env.VOICE_BRIDGE_MODE === 'optimized' 
+                  ? './voiceCallBridgeOptimized' 
+                  : './voiceCallBridge';
+                import(bridgeModule).then(({ startVoiceCallBridge }) => {
                   startVoiceCallBridge(
                     connection!,
                     agentId,
@@ -247,7 +250,10 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
                 inboundTrackBuffer += base64Chunk;
                 lastInboundTimestamp = timestamp;
 
-                import('./voiceCallBridge').then(({ handleInboundAudio }) => {
+                const bridgeModule = env.VOICE_BRIDGE_MODE === 'optimized' 
+                  ? './voiceCallBridgeOptimized' 
+                  : './voiceCallBridge';
+                import(bridgeModule).then(({ handleInboundAudio }) => {
                   handleInboundAudio(connection!.callSid, audioChunk, timestamp);
                 }).catch((error: any) => {
                   logger.error('[MEDIA_STREAM] Failed to handle audio', {
@@ -299,8 +305,11 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
             // Cleanup
             activeStreams.delete(callSid);
             
-            // Notify bridge to cleanup
-            import('./voiceCallBridge').then(({ stopVoiceCallBridge }) => {
+            // Notify bridge to cleanup (switchable between standard and optimized)
+            const bridgeModule = env.VOICE_BRIDGE_MODE === 'optimized' 
+              ? './voiceCallBridgeOptimized' 
+              : './voiceCallBridge';
+            import(bridgeModule).then(({ stopVoiceCallBridge }) => {
               stopVoiceCallBridge(callSid);
             }).catch((error: any) => {
               logger.error('[MEDIA_STREAM] Failed to stop bridge', {
@@ -369,8 +378,11 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
         activeConnections: connectionStats.active,
       });
       
-      // Cleanup bridge
-      import('./voiceCallBridge').then(({ stopVoiceCallBridge }) => {
+      // Cleanup bridge (switchable between standard and optimized)
+      const bridgeModule = env.VOICE_BRIDGE_MODE === 'optimized' 
+        ? './voiceCallBridgeOptimized' 
+        : './voiceCallBridge';
+      import(bridgeModule).then(({ stopVoiceCallBridge }) => {
         stopVoiceCallBridge(connection!.callSid);
       }).catch(() => {
         // Ignore cleanup errors

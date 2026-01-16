@@ -13,6 +13,43 @@ export interface AgentResponse {
   responseTimeMs?: number;
 }
 
+// Singleton OpenAI client - reuse across all requests for better performance
+let openaiClient: OpenAI | null = null;
+
+function getOpenAIClient(): OpenAI {
+  if (openaiClient) {
+    return openaiClient;
+  }
+
+  const apiKey = env.OPENAI_API_KEY?.trim();
+  if (!apiKey || apiKey.length === 0) {
+    throw new Error('OPENAI_API_KEY is not configured');
+  }
+
+  const isOpenRouter = apiKey.startsWith('sk-or-');
+  const isProjectKey = apiKey.startsWith('sk-proj-');
+  const baseURL = env.OPENAI_BASE_URL || (isOpenRouter ? 'https://openrouter.ai/api/v1' : undefined);
+  
+  // Only log on first initialization
+  logger.info('[OPENAI] Initializing OpenAI client (singleton)', {
+    hasApiKey: true,
+    apiKeyPrefix: apiKey.substring(0, 15) + '...',
+    apiKeyLength: apiKey.length,
+    keyType: isProjectKey ? 'project_key' : isOpenRouter ? 'openrouter' : 'standard',
+    isOpenRouter,
+    baseURL: baseURL || 'https://api.openai.com/v1 (default)',
+    model: env.OPENAI_MODEL,
+    note: 'Client will be reused for all subsequent requests - no re-initialization needed',
+  });
+
+  openaiClient = new OpenAI({
+    apiKey: apiKey,
+    ...(baseURL && { baseURL }),
+  });
+
+  return openaiClient;
+}
+
 /**
  * Send a message to OpenAI and get response
  * Matches the interface of elevenlabsAgent.sendMessageToAgent for easy switching
@@ -24,7 +61,8 @@ export async function sendMessageToOpenAI(
   contactId?: string,
   accountId?: string,
   maxRetries: number = 3,
-  campaignInstructions?: string // Campaign instructions for AI context
+  campaignInstructions?: string, // Campaign instructions for AI context
+  preloadedContext?: { systemPrompt: string; conversationHistory: Array<{ role: 'user' | 'assistant'; content: string; timestamp: Date }> }
 ): Promise<AgentResponse> {
   const startTime = Date.now();
   let lastError: Error | null = null;
@@ -51,26 +89,8 @@ export async function sendMessageToOpenAI(
     });
   }
 
-  // Initialize OpenAI client
-  // Detect if using OpenRouter (key starts with sk-or-) or custom base URL
-  const isOpenRouter = apiKey.startsWith('sk-or-');
-  const isProjectKey = apiKey.startsWith('sk-proj-');
-  const baseURL = env.OPENAI_BASE_URL || (isOpenRouter ? 'https://openrouter.ai/api/v1' : undefined);
-  
-  logger.info('[OPENAI] Initializing OpenAI client', {
-    hasApiKey: true,
-    apiKeyPrefix: apiKey.substring(0, 15) + '...',
-    apiKeyLength: apiKey.length,
-    keyType: isProjectKey ? 'project_key' : isOpenRouter ? 'openrouter' : 'standard',
-    isOpenRouter,
-    baseURL: baseURL || 'https://api.openai.com/v1 (default)',
-    model: env.OPENAI_MODEL,
-  });
-
-  const openai = new OpenAI({
-    apiKey: apiKey, // Use trimmed key
-    ...(baseURL && { baseURL }), // Use custom base URL if provided (for OpenRouter, etc.)
-  });
+  // Get singleton OpenAI client (reused across all requests)
+  const openai = getOpenAIClient();
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -89,8 +109,20 @@ export async function sendMessageToOpenAI(
       });
 
       // Build context for the prompt
-      const systemPrompt = await buildSystemPrompt(accountId, contactId, campaignInstructions);
-      const conversationHistory = await getConversationHistory(contactId, accountId);
+      // Use preloaded context if available (for voice calls - reduces latency significantly)
+      // Otherwise load on-demand
+      const systemPrompt = preloadedContext?.systemPrompt 
+        || await buildSystemPrompt(accountId, contactId, campaignInstructions);
+      const conversationHistory = preloadedContext?.conversationHistory 
+        || await getConversationHistory(contactId, accountId);
+      
+      if (preloadedContext) {
+        logger.debug('[OPENAI] Using preloaded context', {
+          hasSystemPrompt: !!preloadedContext.systemPrompt,
+          historyLength: preloadedContext.conversationHistory.length,
+          note: 'Skipped database queries - faster response',
+        });
+      }
 
       // Build messages array
       const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
@@ -123,7 +155,7 @@ export async function sendMessageToOpenAI(
           model: env.OPENAI_MODEL,
           messages,
           temperature: 0.7,
-          max_tokens: 500, // Reasonable limit for email/SMS responses
+          max_tokens: 200, // Reduced from 500 to 200 for voice calls - faster generation, more concise responses
         }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('OpenAI API timeout after 30 seconds')), 30000)
@@ -216,8 +248,9 @@ export async function sendMessageToOpenAI(
 
 /**
  * Build system prompt with context about campaigns, deals, and company
+ * Exported for use in voice call bridge preloading
  */
-async function buildSystemPrompt(
+export async function buildSystemPrompt(
   accountId?: string, 
   contactId?: string,
   campaignInstructions?: string // Campaign instructions for context
@@ -365,8 +398,9 @@ Guidelines:
 
 /**
  * Get conversation history from MongoDB for context
+ * Exported for use in voice call bridge preloading
  */
-async function getConversationHistory(
+export async function getConversationHistory(
   contactId?: string,
   accountId?: string
 ): Promise<Array<{ role: 'user' | 'assistant'; content: string; timestamp: Date }>> {

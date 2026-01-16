@@ -1,11 +1,12 @@
 import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { sendAudioToStream, MediaStreamConnection } from './twilioMediaStreams';
-import { createSTTStream, STTStream, STTResult } from './speechToText';
+import { STTResult } from './speechToText';
 import { sendMessageToAgent } from './agentService'; // Use unified agent service (OpenAI Chat API)
 import { upsertConversation, addMessageToConversation } from './conversationService';
 import { buildSystemPrompt, getConversationHistory } from './openaiAgent';
-import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
+import { Readable } from 'stream';
+import { ElevenLabsClient, RealtimeEvents, AudioFormat, CommitStrategy } from '@elevenlabs/elevenlabs-js';
 
 interface PreloadedContext {
   systemPrompt: string;
@@ -23,9 +24,9 @@ interface VoiceCallBridge {
   textBuffer: string;
   lastSttTime: number;
   isProcessing: boolean;
-  ttsClient?: any;
+  ttsClient?: ElevenLabsClient;
   voiceId: string;
-  sttStream?: STTStream;
+  sttConnection?: any; // ElevenLabs realtime STT connection (official SDK)
   pendingTranscript: string;
   transcriptTimeout?: NodeJS.Timeout;
   firstAudioSent: boolean; // Track if we've sent the first audio (to add delay after template)
@@ -40,6 +41,7 @@ interface VoiceCallBridge {
   instructions?: string; // Campaign instructions for AI context
   preloadedContext?: PreloadedContext; // Preloaded CRM context to reduce latency
   shouldStopAudio?: boolean; // Flag to stop sending audio chunks (for user interruption)
+  ignoreTranscriptsUntil?: number; // Timestamp until which to ignore transcripts (for clearing buffer)
 }
 
 // Store active bridges
@@ -51,6 +53,7 @@ const pendingAudioBuffers = new Map<string, Array<{ chunk: Buffer; timestamp: nu
 /**
  * Start voice call bridge with simplified flow:
  * Twilio Audio → OpenAI STT → OpenAI Chat API → ElevenLabs TTS → Twilio Audio
+ * OPTIMIZED VERSION: Trusts ulaw_8000 output and streams TTS chunks immediately
  */
 export async function startVoiceCallBridge(
   streamConnection: MediaStreamConnection,
@@ -63,14 +66,15 @@ export async function startVoiceCallBridge(
   const callSid = streamConnection.callSid;
   const voiceId = env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
 
-  logger.info('[VOICE_BRIDGE] Starting simplified bridge (OpenAI STT → OpenAI Chat → ElevenLabs TTS)', {
+  logger.info('[VOICE_BRIDGE_OPTIMIZED] Starting optimized bridge (ElevenLabs STT → OpenAI Chat → ElevenLabs TTS)', {
     callSid,
     agentId: agentId.substring(0, 8) + '...',
     contactId,
     accountId: accountId || 'MISSING',
     hasAccountId: !!accountId,
     hasContactId: !!contactId,
-    sttProvider: env.STT_PROVIDER || 'openai',
+    sttProvider: 'elevenlabs', // FORCED for optimized version (real-time streaming)
+    ttsProvider: 'elevenlabs', // FORCED for optimized version
     aiProvider: 'openai',
     note: accountId 
       ? '✅ Agent will have CRM context (campaigns, deals, contact info)' 
@@ -84,28 +88,136 @@ export async function startVoiceCallBridge(
       ttsClient = new ElevenLabsClient({
         apiKey: env.ELEVENLABS_API_KEY,
       });
-      logger.info('[VOICE_BRIDGE] ElevenLabs TTS client initialized', { callSid });
+      logger.info('[VOICE_BRIDGE_OPTIMIZED] ElevenLabs TTS client initialized', { callSid });
     } catch (error: any) {
-      logger.error('[VOICE_BRIDGE] Failed to initialize TTS client', {
+      logger.error('[VOICE_BRIDGE_OPTIMIZED] Failed to initialize TTS client', {
         callSid,
         error: error.message,
       });
     }
   } else {
-    logger.warn('[VOICE_BRIDGE] ELEVENLABS_API_KEY not configured - TTS will not work', { callSid });
+    logger.warn('[VOICE_BRIDGE_OPTIMIZED] ELEVENLABS_API_KEY not configured - TTS will not work', { callSid });
   }
 
-  // Create STT stream for real-time transcription (OpenAI Whisper by default)
-  const sttStream = createSTTStream((result: STTResult) => {
-    handleSTTResult(callSid, result);
-  });
-
-  if (!sttStream) {
-    logger.warn('[VOICE_BRIDGE] STT stream not available - audio will not be transcribed', {
+  // Create STT connection using official SDK - FORCE ElevenLabs for optimized version
+  // Per docs: https://elevenlabs.io/docs/developers/guides/cookbooks/speech-to-text/realtime/server-side-streaming
+  let sttConnection: any = null;
+  
+  if (!env.ELEVENLABS_API_KEY) {
+    logger.warn('[VOICE_BRIDGE_OPTIMIZED] ELEVENLABS_API_KEY not configured - STT will not work', {
       callSid,
-      sttProvider: env.STT_PROVIDER || 'openai',
-      hasOpenAIKey: !!env.OPENAI_API_KEY,
+      note: 'ELEVENLABS_API_KEY required for optimized version (both STT and TTS)',
     });
+  } else {
+    try {
+      const sttClient = new ElevenLabsClient({
+        apiKey: env.ELEVENLABS_API_KEY,
+      });
+
+      // Connect using official SDK with manual audio chunking
+      sttConnection = await sttClient.speechToText.realtime.connect({
+        modelId: 'scribe_v2_realtime',
+        audioFormat: AudioFormat.ULAW_8000,
+        sampleRate: 8000,
+        commitStrategy: CommitStrategy.VAD,
+        vadThreshold: 0.4,
+        vadSilenceThresholdSecs: 1.5,
+        minSpeechDurationMs: 100,
+        minSilenceDurationMs: 100,
+        includeTimestamps: true,
+      });
+
+      // Set up event handlers per official SDK documentation
+      sttConnection.on(RealtimeEvents.SESSION_STARTED, (data: any) => {
+        logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ ElevenLabs STT session started', {
+          callSid,
+          sessionData: data,
+          note: 'Using ElevenLabs Scribe v2 Realtime for lower latency STT',
+        });
+      });
+
+      sttConnection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (transcript: any) => {
+        const text = typeof transcript === 'string' ? transcript : (transcript.text || '');
+        logger.info('[VOICE_BRIDGE_OPTIMIZED] 🎤 ElevenLabs PARTIAL transcript', {
+          callSid,
+          text,
+          confidence: transcript.confidence,
+          note: 'Partial transcript from ElevenLabs STT',
+        });
+        
+        if (text && text.trim()) {
+          handleSTTResult(callSid, {
+            text: text.trim(),
+            isFinal: false,
+            confidence: transcript.confidence,
+          });
+        }
+      });
+
+      sttConnection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, (transcript: any) => {
+        const text = typeof transcript === 'string' ? transcript : (transcript.text || '');
+        logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ ElevenLabs COMMITTED transcript', {
+          callSid,
+          text,
+          confidence: transcript.confidence,
+          note: 'Final transcript from ElevenLabs STT',
+        });
+        
+        if (text && text.trim()) {
+          handleSTTResult(callSid, {
+            text: text.trim(),
+            isFinal: true,
+            confidence: transcript.confidence,
+          });
+        }
+      });
+
+      sttConnection.on(RealtimeEvents.COMMITTED_TRANSCRIPT_WITH_TIMESTAMPS, (transcript: any) => {
+        const text = typeof transcript === 'string' ? transcript : (transcript.text || '');
+        logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ ElevenLabs COMMITTED transcript with timestamps', {
+          callSid,
+          text,
+          words: transcript.words,
+          confidence: transcript.confidence,
+          note: 'Final transcript with word-level timestamps from ElevenLabs STT',
+        });
+        
+        if (text && text.trim()) {
+          handleSTTResult(callSid, {
+            text: text.trim(),
+            isFinal: true,
+            confidence: transcript.confidence,
+          });
+        }
+      });
+
+      sttConnection.on(RealtimeEvents.ERROR, (error: any) => {
+        logger.error('[VOICE_BRIDGE_OPTIMIZED] ❌ ElevenLabs STT error', {
+          callSid,
+          error: error.message || error,
+          errorType: error.type,
+          note: 'Error from ElevenLabs STT connection',
+        });
+      });
+
+      sttConnection.on(RealtimeEvents.CLOSE, () => {
+        logger.info('[VOICE_BRIDGE_OPTIMIZED] ElevenLabs STT connection closed', {
+          callSid,
+          note: 'STT connection closed',
+        });
+      });
+
+      logger.info('[VOICE_BRIDGE_OPTIMIZED] ElevenLabs STT connection created (real-time streaming)', {
+        callSid,
+        note: 'Using ElevenLabs Scribe v2 Realtime for lower latency STT',
+      });
+    } catch (error: any) {
+      logger.error('[VOICE_BRIDGE_OPTIMIZED] Failed to create ElevenLabs STT connection', {
+        callSid,
+        error: error.message,
+        note: 'STT will not be available for this call',
+      });
+    }
   }
 
   const bridge: VoiceCallBridge = {
@@ -119,7 +231,7 @@ export async function startVoiceCallBridge(
     isProcessing: false,
     ttsClient,
     voiceId,
-    sttStream: sttStream || undefined,
+    sttConnection: sttConnection || undefined,
     pendingTranscript: '',
     firstAudioSent: false,
     lastSttLogTime: 0,
@@ -140,7 +252,7 @@ export async function startVoiceCallBridge(
         const bridge = activeBridges.get(callSid);
         if (bridge) {
           bridge.preloadedContext = context;
-          logger.info('[VOICE_BRIDGE] Context preloaded successfully', {
+          logger.info('[VOICE_BRIDGE_OPTIMIZED] Context preloaded successfully', {
             callSid,
             hasSystemPrompt: !!context.systemPrompt,
             historyLength: context.conversationHistory.length,
@@ -150,14 +262,14 @@ export async function startVoiceCallBridge(
         }
       }
     }).catch((error: any) => {
-      logger.warn('[VOICE_BRIDGE] Failed to preload context', {
+      logger.warn('[VOICE_BRIDGE_OPTIMIZED] Failed to preload context', {
         callSid,
         error: error.message,
         note: 'Will load on-demand (slower)',
       });
     });
   } else {
-    logger.debug('[VOICE_BRIDGE] Skipping context preload - missing accountId or contactId', {
+    logger.debug('[VOICE_BRIDGE_OPTIMIZED] Skipping context preload - missing accountId or contactId', {
       callSid,
       hasAccountId: !!accountId,
       hasContactId: !!contactId,
@@ -167,7 +279,7 @@ export async function startVoiceCallBridge(
   // Flush any buffered audio chunks that arrived before bridge was ready
   const bufferedChunks = pendingAudioBuffers.get(callSid);
   if (bufferedChunks && bufferedChunks.length > 0) {
-    logger.info('[VOICE_BRIDGE] Flushing buffered audio chunks', {
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] Flushing buffered audio chunks', {
       callSid,
       bufferedChunkCount: bufferedChunks.length,
       note: 'Processing audio that arrived before bridge was ready',
@@ -179,15 +291,15 @@ export async function startVoiceCallBridge(
     
     pendingAudioBuffers.delete(callSid);
     
-    logger.info('[VOICE_BRIDGE] Finished flushing buffered audio chunks', {
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] Finished flushing buffered audio chunks', {
       callSid,
       processedChunks: bufferedChunks.length,
     });
   }
 
-  logger.info('[VOICE_BRIDGE] Bridge started successfully', {
+  logger.info('[VOICE_BRIDGE_OPTIMIZED] Bridge started successfully', {
     callSid,
-    hasSttStream: !!sttStream,
+    hasSttConnection: !!sttConnection,
     hasTtsClient: !!ttsClient,
   });
 
@@ -218,7 +330,7 @@ export async function startVoiceCallBridge(
     const bridge = activeBridges.get(callSid);
     const hasPreloadedContext = !!bridge?.preloadedContext;
     
-    logger.info('[VOICE_BRIDGE] Sending initial greeting immediately', {
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] Sending initial greeting immediately', {
       callSid,
       hasInstructions: !!instructions,
       greetingLength: greetingMessage.length,
@@ -234,7 +346,7 @@ export async function startVoiceCallBridge(
     // The sendMessageToAgent function will use preloaded context if available,
     // or load on-demand if not ready yet (happens in parallel, doesn't block)
     sendTextToAgent(callSid, greetingMessage).catch((error: any) => {
-      logger.error('[VOICE_BRIDGE] Failed to send initial greeting to agent', { 
+      logger.error('[VOICE_BRIDGE_OPTIMIZED] Failed to send initial greeting to agent', { 
         callSid, 
         error: error.message,
         stack: error.stack,
@@ -245,7 +357,7 @@ export async function startVoiceCallBridge(
     const missing = [];
     if (!ttsClient) missing.push('TTS client (ELEVENLABS_API_KEY)');
     if (!env.OPENAI_API_KEY) missing.push('OpenAI API key');
-    logger.warn('[VOICE_BRIDGE] Cannot send initial greeting - missing configuration', { 
+    logger.warn('[VOICE_BRIDGE_OPTIMIZED] Cannot send initial greeting - missing configuration', { 
       callSid,
       missing: missing.join(', '),
       note: 'AI will not speak until caller says something first',
@@ -267,7 +379,7 @@ export async function handleInboundAudio(
     // Bridge not ready yet - buffer the audio
     if (!pendingAudioBuffers.has(callSid)) {
       pendingAudioBuffers.set(callSid, []);
-      logger.info('[VOICE_BRIDGE] Bridge not ready, buffering audio chunks', {
+      logger.info('[VOICE_BRIDGE_OPTIMIZED] Bridge not ready, buffering audio chunks', {
         callSid,
         chunkSize: audioChunk.length,
         timestamp,
@@ -279,7 +391,7 @@ export async function handleInboundAudio(
     buffer.push({ chunk: audioChunk, timestamp });
     
     if (buffer.length % 10 === 0) {
-      logger.debug('[VOICE_BRIDGE] Buffering audio chunk (bridge not ready)', {
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Buffering audio chunk (bridge not ready)', {
         callSid,
         bufferedChunks: buffer.length,
         chunkSize: audioChunk.length,
@@ -294,13 +406,22 @@ export async function handleInboundAudio(
   // We need to keep audio flowing to STT so user can interrupt
   // Note: Audio will be filtered in handleSTTResult if it's echo
 
-  // Send audio to STT stream
-  if (bridge.sttStream) {
+  // Send audio to STT connection using official SDK
+  if (bridge.sttConnection) {
     try {
-      bridge.sttStream.write(audioChunk);
+      // Convert audio chunk to base64 and send using official SDK
+      // Per docs: https://elevenlabs.io/docs/developers/guides/cookbooks/speech-to-text/realtime/server-side-streaming
+      // Audio is μ-law 8kHz format from Twilio (matches connection config: AudioFormat.ULAW_8000, sampleRate: 8000)
+      const audioBase64 = audioChunk.toString('base64');
+      
+      bridge.sttConnection.send({
+        audioBase64,
+        sampleRate: 8000, // Must match connection config (ULAW_8000 format)
+      });
+      
       bridge.lastSttTime = Date.now();
     } catch (error: any) {
-      logger.error('[VOICE_BRIDGE] STT stream error', {
+      logger.error('[VOICE_BRIDGE_OPTIMIZED] STT connection error', {
         callSid,
         error: error.message,
       });
@@ -314,7 +435,7 @@ export async function handleInboundAudio(
     bridge.audioBuffer.push(audioChunk);
     bridge.lastSttTime = Date.now();
     
-    logger.warn('[VOICE_BRIDGE] STT stream not available, buffering audio', {
+    logger.warn('[VOICE_BRIDGE_OPTIMIZED] STT connection not available, buffering audio', {
       callSid,
       chunkSize: audioChunk.length,
       timestamp,
@@ -330,6 +451,17 @@ export async function handleInboundAudio(
 function handleSTTResult(callSid: string, result: STTResult): void {
   const bridge = activeBridges.get(callSid);
   if (!bridge) return;
+
+  // Check if we should ignore transcripts (simulates clearing buffer)
+  if (bridge.ignoreTranscriptsUntil && Date.now() < bridge.ignoreTranscriptsUntil) {
+    logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcript - within ignore window', {
+      callSid,
+      text: result.text.substring(0, 50),
+      ignoreUntil: bridge.ignoreTranscriptsUntil,
+      currentTime: Date.now(),
+    });
+    return;
+  }
 
   // Allow user to interrupt AI - process transcripts even when AI is speaking
   // But filter echo (very short fragments or known echo phrases within echo window)
@@ -347,7 +479,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       (timeSinceAIStarted > 2000 || result.text.trim().length > 20); // Either time passed or substantial text
     
     if (!isLikelyUserSpeech) {
-      logger.debug('[VOICE_BRIDGE] Ignoring transcript - likely echo while AI speaking', {
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcript - likely echo while AI speaking', {
         callSid,
         text: result.text.substring(0, 50),
         timeSinceAIStarted,
@@ -357,7 +489,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
     }
     
     // User is interrupting - stop AI and process their input
-    logger.info('[VOICE_BRIDGE] 🛑 User interrupting AI', {
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] 🛑 User interrupting AI', {
       callSid,
       text: result.text.substring(0, 100),
       timeSinceAIStarted,
@@ -397,7 +529,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
     );
     
     if (isSystemPromptPhrase) {
-      logger.debug('[VOICE_BRIDGE] Ignoring system prompt phrase (AI echo)', {
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring system prompt phrase (AI echo)', {
         callSid,
         text: finalText,
         note: 'This is from the system prompt - AI is speaking its own instructions',
@@ -415,7 +547,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       : Infinity;
     
     if (timeSinceLastProcess < 500) {
-      logger.debug('[VOICE_BRIDGE] Ignoring transcript - too soon after last one', {
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcript - too soon after last one', {
         callSid,
         text: finalText.substring(0, 50),
         timeSinceLastProcess,
@@ -429,7 +561,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
     if (bridge.lastTranscriptText === finalText && 
         bridge.lastTranscriptTime && 
         (now - bridge.lastTranscriptTime) < 10000) {
-      logger.debug('[VOICE_BRIDGE] Ignoring duplicate transcript', {
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring duplicate transcript', {
         callSid,
         text: finalText,
         timeSinceLastTranscript: now - (bridge.lastTranscriptTime || 0),
@@ -481,7 +613,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
     
     // Don't filter if user is actively interrupting (substantial text while AI is speaking)
     if (isUserInterrupting) {
-      logger.info('[VOICE_BRIDGE] User interrupting - allowing through', {
+      logger.info('[VOICE_BRIDGE_OPTIMIZED] User interrupting - allowing through', {
         callSid,
         text: finalText.substring(0, 50),
         note: 'User is interrupting AI - not filtering as echo',
@@ -493,7 +625,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       const isSubstantialText = finalText.trim().length > 15;
       
       if (isSubstantialText) {
-        logger.debug('[VOICE_BRIDGE] Allowing substantial text despite echo phrase match', {
+        logger.debug('[VOICE_BRIDGE_OPTIMIZED] Allowing substantial text despite echo phrase match', {
           callSid,
           text: finalText.substring(0, 50),
           length: finalText.length,
@@ -501,7 +633,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
         });
         // Continue to process - don't filter substantial text
       } else {
-        logger.debug('[VOICE_BRIDGE] Ignoring likely echo phrase', {
+        logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring likely echo phrase', {
           callSid,
           text: finalText,
           timeSinceAIFinished,
@@ -515,7 +647,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
     // Also filter very short fragments within echo window (existing logic, but with extended window)
     const isVeryShortFragment = finalText.length < 5 && finalText.length > 0;
     if (isVeryShortFragment && isWithinEchoWindow) {
-      logger.debug('[VOICE_BRIDGE] Ignoring likely echo fragment', {
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring likely echo fragment', {
         callSid,
         text: finalText,
         timeSinceAIFinished,
@@ -527,7 +659,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
     // Process legitimate transcripts (including interruptions)
     // Allow processing even if waiting for response (user can interrupt)
     if (finalText) { // Removed !bridge.isWaitingForResponse check to allow interruption
-      logger.info('[VOICE_BRIDGE] 📝 Transcript:', {
+      logger.info('[VOICE_BRIDGE_OPTIMIZED] 📝 Transcript:', {
         callSid,
         text: finalText,
         timeSinceAIFinished: timeSinceAIFinished !== Infinity ? timeSinceAIFinished : 'N/A',
@@ -549,7 +681,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
         bridge.shouldStopAudio = true;
         bridge.isAISpeaking = false;
         bridge.aiSpeechEndTime = Date.now();
-        logger.info('[VOICE_BRIDGE] 🛑 Stopped AI - user interrupted', { callSid });
+        logger.info('[VOICE_BRIDGE_OPTIMIZED] 🛑 Stopped AI - user interrupted', { callSid });
       }
       
       sendTextToAgent(callSid, finalText);
@@ -573,7 +705,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       if ((isSubstantial || hasPunctuation) && !bridge.isWaitingForResponse) {
         bridge.transcriptTimeout = setTimeout(() => {
           if (bridge.pendingTranscript && !bridge.isWaitingForResponse && !bridge.isAISpeaking) {
-            logger.info('[VOICE_BRIDGE] 📝 Sending interim transcript:', {
+            logger.info('[VOICE_BRIDGE_OPTIMIZED] 📝 Sending interim transcript:', {
               callSid,
               text: bridge.pendingTranscript,
             });
@@ -599,7 +731,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
 async function sendTextToAgent(callSid: string, text: string): Promise<void> {
   const bridge = activeBridges.get(callSid);
   if (!bridge) {
-    logger.warn('[VOICE_BRIDGE] Cannot send text - bridge not available', { callSid });
+    logger.warn('[VOICE_BRIDGE_OPTIMIZED] Cannot send text - bridge not available', { callSid });
     return;
   }
 
@@ -609,11 +741,12 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
   }
 
   try {
-    // CRITICAL: Clear STT buffer BEFORE getting AI response to prevent processing stale audio
+    // CRITICAL: Ignore transcripts temporarily BEFORE getting AI response to prevent processing stale audio
     // This prevents echo fragments from being transcribed from audio buffered before AI spoke
-    if (bridge.sttStream && typeof bridge.sttStream.clear === 'function') {
-      bridge.sttStream.clear();
-      logger.debug('[VOICE_BRIDGE] Cleared STT buffer - preparing for AI response', { callSid });
+    // Official SDK doesn't have a clear() method, so we use timestamp-based filtering
+    if (bridge.sttConnection) {
+      bridge.ignoreTranscriptsUntil = Date.now() + 500; // Ignore transcripts for 500ms
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcripts temporarily - preparing for AI response', { callSid });
     }
 
     // Check if we have preloaded context (for faster response)
@@ -622,7 +755,7 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
       ? Date.now() - bridge.preloadedContext.loadedAt 
       : 0;
     
-    logger.info('[VOICE_BRIDGE] 📤 Sending to AI', {
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] 📤 Sending to AI', {
       callSid,
       text: text.substring(0, 150),
       textLength: text.length,
@@ -652,18 +785,19 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
       bridge.preloadedContext // Pass preloaded context if available
     );
 
-    // CRITICAL: Clear STT buffer again before starting TTS (extra safety)
+    // CRITICAL: Ignore transcripts temporarily before starting TTS (extra safety)
     // This ensures no audio is processed while AI is generating response
-    if (bridge.sttStream && typeof bridge.sttStream.clear === 'function') {
-      bridge.sttStream.clear();
-      logger.debug('[VOICE_BRIDGE] Cleared STT buffer again - before TTS', { callSid });
+    // Official SDK doesn't have a clear() method, so we use timestamp-based filtering
+    if (bridge.sttConnection) {
+      bridge.ignoreTranscriptsUntil = Date.now() + 500; // Ignore transcripts for 500ms
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcripts temporarily - before TTS', { callSid });
     }
 
     // DON'T reset isWaitingForResponse here - let sendAgentResponseAsAudio handle it after audio finishes
     // This prevents new transcripts from being processed while AI is speaking
 
     if (response.success && response.response) {
-      logger.info('[VOICE_BRIDGE] ✅ AI response received', {
+      logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ AI response received', {
         callSid,
         responseLength: response.response.length,
         responsePreview: response.response.substring(0, 150),
@@ -697,7 +831,7 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
             );
           }
         } catch (error: any) {
-          logger.error('[VOICE_BRIDGE] Failed to store AI response', error, {
+          logger.error('[VOICE_BRIDGE_OPTIMIZED] Failed to store AI response', error, {
             callSid,
             note: 'Call continues despite conversation storage failure',
           });
@@ -708,14 +842,14 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
       // Don't reset isWaitingForResponse here - let sendAgentResponseAsAudio handle it
     } else {
       bridge.isWaitingForResponse = false; // Only reset on error (no audio will be played)
-      logger.error('[VOICE_BRIDGE] ❌ AI response failed', {
+      logger.error('[VOICE_BRIDGE_OPTIMIZED] ❌ AI response failed', {
         callSid,
         error: response.error,
       });
     }
   } catch (error: any) {
     bridge.isWaitingForResponse = false; // Only reset on exception (no audio will be played)
-    logger.error('[VOICE_BRIDGE] ❌ Exception sending to AI', {
+    logger.error('[VOICE_BRIDGE_OPTIMIZED] ❌ Exception sending to AI', {
       callSid,
       error: error.message,
     });
@@ -724,11 +858,12 @@ async function sendTextToAgent(callSid: string, text: string): Promise<void> {
 
 /**
  * Convert agent text response to audio and send to caller
+ * OPTIMIZED VERSION: Trusts ulaw_8000 output and streams chunks immediately
  */
 async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<void> {
   const bridge = activeBridges.get(callSid);
   if (!bridge || !bridge.ttsClient) {
-    logger.error('[VOICE_BRIDGE] TTS client not available', { 
+    logger.error('[VOICE_BRIDGE_OPTIMIZED] TTS client not available', { 
       callSid,
       hasBridge: !!bridge,
       hasTtsClient: !!(bridge && bridge.ttsClient),
@@ -737,44 +872,44 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
   }
 
   if (!text || !text.trim()) {
-    logger.warn('[VOICE_BRIDGE] Cannot convert empty text to audio', { callSid });
+    logger.warn('[VOICE_BRIDGE_OPTIMIZED] Cannot convert empty text to audio', { callSid });
     return;
   }
 
   try {
-    logger.info('[VOICE_BRIDGE] Converting text to audio via ElevenLabs TTS', {
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] Converting text to audio via ElevenLabs TTS (optimized)', {
       callSid,
       textLength: text.length,
       textPreview: text.substring(0, 50) + '...',
       voiceId: bridge.voiceId,
       hasTtsClient: !!bridge.ttsClient,
+      note: 'OPTIMIZED: Trusting ulaw_8000 output and streaming chunks immediately',
     });
 
-    // Use ElevenLabs streaming TTS with ulaw_8000 output format (direct μ-law 8kHz - no conversion needed!)
+    // Use ElevenLabs streaming TTS with ulaw_8000 output format
     // Based on ElevenLabs Twilio integration guide: https://elevenlabs.io/docs/developers/guides/cookbooks/text-to-speech/twilio
-    // Using exact format from docs: camelCase parameters and send all audio at once
-    let audioStream;
+    let response;
     try {
-      // Try camelCase format as shown in ElevenLabs docs
-      audioStream = await bridge.ttsClient.textToSpeech.convert(bridge.voiceId, {
+      // Use camelCase format as shown in ElevenLabs docs
+      response = await bridge.ttsClient.textToSpeech.convert(bridge.voiceId, {
         text,
         modelId: 'eleven_flash_v2_5', // camelCase as per ElevenLabs Twilio guide
-        outputFormat: 'ulaw_8000', // camelCase - Direct μ-law 8kHz output - no conversion needed!
+        outputFormat: 'ulaw_8000', // camelCase - Direct μ-law 8kHz output
       });
     } catch (error: any) {
       // If camelCase fails, try snake_case (SDK might accept both)
-      logger.warn('[VOICE_BRIDGE] camelCase format failed, trying snake_case', {
+      logger.warn('[VOICE_BRIDGE_OPTIMIZED] camelCase format failed, trying snake_case', {
         callSid,
         error: error.message,
       });
       try {
-        audioStream = await bridge.ttsClient.textToSpeech.convert(bridge.voiceId, {
+        response = await bridge.ttsClient.textToSpeech.convert(bridge.voiceId, {
           text,
-          model_id: 'eleven_flash_v2_5',
-          output_format: 'ulaw_8000',
+          modelId: 'eleven_flash_v2_5',
+          outputFormat: 'ulaw_8000',
         });
       } catch (error2: any) {
-        logger.error('[VOICE_BRIDGE] Failed to convert text to audio with ulaw_8000 format', {
+        logger.error('[VOICE_BRIDGE_OPTIMIZED] Failed to convert text to audio with ulaw_8000 format', {
           callSid,
           camelCaseError: error.message,
           snakeCaseError: error2.message,
@@ -784,296 +919,139 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
       }
     }
 
-    // Accumulate all audio chunks from ElevenLabs (as per docs - send all at once)
-    const audioChunks: Buffer[] = [];
-    let chunkCount = 0;
-    for await (const audioChunk of audioStream) {
-      audioChunks.push(Buffer.from(audioChunk));
-      chunkCount++;
-    }
+    // Convert response to Readable stream (as per ElevenLabs Twilio guide)
+    const readableStream = Readable.from(response);
 
-    if (audioChunks.length === 0) {
-      logger.error('[VOICE_BRIDGE] ❌ No audio chunks received from ElevenLabs', {
-        callSid,
-        textLength: text.length,
-        note: 'ElevenLabs TTS stream returned empty - check API key, voice ID, and text content',
+    // Helper function to collect all chunks (exactly as per ElevenLabs sample)
+    const streamToArrayBuffer = (readableStream: Readable): Promise<ArrayBuffer> => {
+      return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+
+        readableStream.on('data', (chunk: Buffer) => {
+          chunks.push(chunk);
+        });
+
+        readableStream.on('end', () => {
+          resolve(Buffer.concat(chunks).buffer);
+        });
+
+        readableStream.on('error', reject);
       });
-      return;
-    }
-
-    // Combine all audio chunks into single buffer
-    const rawAudioBuffer = Buffer.concat(audioChunks);
-    
-    logger.debug('[VOICE_BRIDGE] ✅ Received audio from ElevenLabs', {
-      callSid,
-      chunkCount,
-      totalBytes: rawAudioBuffer.length,
-      avgChunkSize: Math.round(rawAudioBuffer.length / chunkCount),
-    });
-    
-    // Official @elevenlabs/elevenlabs-js package correctly handles ulaw_8000 output format
-    // No conversion needed - trust the official package
-    
-    if (!bridge.firstAudioSent) {
-      bridge.firstAudioSent = true;
-    }
-
-    // Check if bridge still exists (stream might have closed)
-    const bridgeStillExists = activeBridges.has(callSid);
-    if (!bridgeStillExists) {
-      bridge.isAISpeaking = false;
-      return;
-    }
+    };
 
     // Mark AI as speaking - suppress STT during this time to prevent echo
     bridge.isAISpeaking = true;
     bridge.aiSpeechStartTime = Date.now();
     
-    // CRITICAL: Clear STT buffer when AI starts speaking to prevent processing stale audio
-    // This prevents echo fragments like "you" from being transcribed from audio buffered before AI spoke
-    if (bridge.sttStream && typeof bridge.sttStream.clear === 'function') {
-      bridge.sttStream.clear();
-      logger.debug('[VOICE_BRIDGE] Cleared STT buffer - AI is speaking', { callSid });
+    // CRITICAL: Ignore transcripts temporarily when AI starts speaking to prevent processing stale audio
+    // Official SDK doesn't have a clear() method, so we use timestamp-based filtering
+    if (bridge.sttConnection) {
+      bridge.ignoreTranscriptsUntil = Date.now() + 500; // Ignore transcripts for 500ms
+      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcripts temporarily - AI is speaking', { callSid });
     }
     
-    // CRITICAL FIXES: Prevent looping by clearing pending transcripts and keeping isWaitingForResponse true
-    // 1. Clear any pending interim transcripts (prevent sending stale transcripts)
+    // CRITICAL FIXES: Prevent looping by clearing pending transcripts
     bridge.pendingTranscript = '';
-    
-    // 2. Cancel any pending interim transcript timeout (prevent it from firing right after AI speaks)
     if (bridge.transcriptTimeout) {
       clearTimeout(bridge.transcriptTimeout);
       bridge.transcriptTimeout = undefined;
     }
-    
-    // 3. Keep isWaitingForResponse true - don't reset it here! Will reset after audio finishes playing
-    // This prevents new transcripts from being processed while AI is speaking or just finished
     bridge.isWaitingForResponse = true;
     
-    // Calculate estimated speech duration from audio buffer size (μ-law 8kHz: 8000 bytes = 1 second)
-    const baseAudioDurationMs = Math.round((rawAudioBuffer.length / 8000) * 1000);
-    
-    // Dynamic buffer calculation based on audio duration (aggressive for 50% latency reduction):
-    // - Short audio (< 3s): +30% buffer (minimum 500ms) - much faster responses
-    // - Medium (3-10s): +15% buffer (minimum 1000ms) - balanced for normal speech
-    // - Long (> 10s): Fixed 2000ms buffer - longer audio needs processing time
-    let dynamicBufferMs: number;
-    if (baseAudioDurationMs < 3000) {
-      dynamicBufferMs = Math.max(500, Math.round(baseAudioDurationMs * 0.3)); // Reduced from 1500ms min, 50% to 30%
-    } else if (baseAudioDurationMs < 10000) {
-      dynamicBufferMs = Math.max(1000, Math.round(baseAudioDurationMs * 0.15)); // Reduced from 2000ms min, 25% to 15%
-    } else {
-      dynamicBufferMs = 2000; // Reduced from 3000ms
-    }
-    
-    // Network and processing buffer: account for Twilio playback delay and network latency
-    const networkProcessingBufferMs = 200; // Reduced from 500ms to 200ms (60% reduction for 50% latency cut)
-    
-    // Total wait time: audio duration + dynamic buffer + network processing
-    const totalWaitTimeMs = baseAudioDurationMs + dynamicBufferMs + networkProcessingBufferMs;
-    const audioSendTime = Date.now();
-    
-    logger.info('[VOICE_BRIDGE] 🎤 AI speaking', {
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] 🎤 Collecting all audio chunks (as per ElevenLabs sample)', {
       callSid,
-      durationSeconds: (baseAudioDurationMs / 1000).toFixed(1),
-      totalWaitTimeMs,
-      dynamicBufferMs,
-      networkBufferMs: networkProcessingBufferMs,
+      note: 'Following ElevenLabs sample exactly - collecting all chunks before sending',
     });
 
-    // CHUNKED AUDIO SENDING: Send audio in 2-second chunks to allow interruption
-    // This allows user to interrupt AI mid-speech by stopping further chunks
-    const CHUNK_SIZE_BYTES = 16000; // ~2 seconds at 8kHz μ-law (8000 bytes = 1 second)
-    // Calculate delay relative to chunk duration (20-30% of chunk time)
-    // Longer chunks need more time for interruption detection
-    const CHUNK_DELAY_PERCENT = 0.25; // 25% of chunk duration (500ms for 2s chunks, 250ms for 1s chunks)
-    const MIN_CHUNK_DELAY_MS = 200; // Minimum delay (for very short chunks)
-    const MAX_CHUNK_DELAY_MS = 600; // Maximum delay (cap to prevent too slow)
+    // Collect all chunks first (exactly as per ElevenLabs sample)
+    const audioArrayBuffer = await streamToArrayBuffer(readableStream);
     
-    // Calculate relative delay based on chunk size
-    const calculateChunkDelay = (chunkSizeBytes: number): number => {
-      const chunkDurationMs = (chunkSizeBytes / 8000) * 1000;
-      const relativeDelay = Math.round(chunkDurationMs * CHUNK_DELAY_PERCENT);
-      return Math.max(MIN_CHUNK_DELAY_MS, Math.min(MAX_CHUNK_DELAY_MS, relativeDelay));
-    };
+    // Convert to Buffer and send all at once (exactly as per ElevenLabs sample)
+    // Official @elevenlabs/elevenlabs-js package correctly handles ulaw_8000 output format
+    const completeAudioBuffer = Buffer.from(audioArrayBuffer as any);
     
-    bridge.shouldStopAudio = false; // Reset interruption flag
-    
-    let totalBytesSent = 0;
-    let chunkIndex = 0;
-    const totalChunks = Math.ceil(rawAudioBuffer.length / CHUNK_SIZE_BYTES);
-    
-    logger.info('[VOICE_BRIDGE] 🎤 Sending audio in chunks (allows interruption)', {
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ Collected all audio chunks', {
       callSid,
-      totalBytes: rawAudioBuffer.length,
-      chunkSize: CHUNK_SIZE_BYTES,
-      totalChunks,
-      estimatedDurationSeconds: (baseAudioDurationMs / 1000).toFixed(1),
+      totalBytes: completeAudioBuffer.length,
+      estimatedDurationSeconds: (completeAudioBuffer.length / 8000).toFixed(1),
+      note: 'Official @elevenlabs/elevenlabs-js package - ulaw_8000 format should be correct',
     });
+
+    // Send all audio at once (exactly as per ElevenLabs sample pattern)
+    // Note: sendAudioToStream already handles base64 encoding and Twilio message format
+    const success = sendAudioToStream(callSid, completeAudioBuffer);
     
-    // Send audio in chunks with interruption detection
-    const sendChunks = async (): Promise<void> => {
-      for (let i = 0; i < totalChunks; i++) {
-        // Check if user interrupted
-        const currentBridge = activeBridges.get(callSid);
-        if (!currentBridge || currentBridge.shouldStopAudio) {
-          logger.info('[VOICE_BRIDGE] 🛑 Audio sending stopped - user interrupted', {
-            callSid,
-            chunkIndex: i,
-            totalChunks,
-            bytesSent: totalBytesSent,
-            bytesRemaining: rawAudioBuffer.length - totalBytesSent,
-          });
-          break;
-        }
-        
-        // Extract chunk
-        const chunkStart = i * CHUNK_SIZE_BYTES;
-        const chunkEnd = Math.min(chunkStart + CHUNK_SIZE_BYTES, rawAudioBuffer.length);
-        const chunk = rawAudioBuffer.slice(chunkStart, chunkEnd);
-        
-        // Send chunk
-        const success = sendAudioToStream(callSid, chunk);
-        if (!success) {
-          logger.warn('[VOICE_BRIDGE] Failed to send audio chunk', {
-            callSid,
-            chunkIndex: i,
-            note: 'Stream may have closed',
-          });
-          break;
-        }
-        
-        totalBytesSent += chunk.length;
-        chunkIndex = i + 1;
-        
-        // After sending each chunk, check for interruption before sending the next one
-        // Wait between chunks to allow time for interruption detection
-        // Delay is relative to chunk size - longer chunks need more time for interruption detection
-        // Only delay if not the last chunk
-        if (i < totalChunks - 1) {
-          // Calculate delay relative to next chunk's size (for last chunk, use actual size)
-          const nextChunkStart = (i + 1) * CHUNK_SIZE_BYTES;
-          const nextChunkEnd = Math.min(nextChunkStart + CHUNK_SIZE_BYTES, rawAudioBuffer.length);
-          const nextChunkSize = nextChunkEnd - nextChunkStart;
-          const chunkDelayMs = calculateChunkDelay(nextChunkSize);
-          
-          logger.debug('[VOICE_BRIDGE] Chunk delay calculation', {
-            callSid,
-            chunkIndex: i + 1,
-            nextChunkSize,
-            nextChunkDurationMs: (nextChunkSize / 8000) * 1000,
-            calculatedDelayMs: chunkDelayMs,
-            delayPercent: ((chunkDelayMs / ((nextChunkSize / 8000) * 1000)) * 100).toFixed(1) + '%',
-          });
-          
-          // Wait and check for interruption during the delay
-          await new Promise(resolve => setTimeout(resolve, chunkDelayMs));
-          
-          // Check if user interrupted during the delay
-          const currentBridge = activeBridges.get(callSid);
-          if (!currentBridge || currentBridge.shouldStopAudio) {
-            logger.info('[VOICE_BRIDGE] 🛑 Interruption detected between chunks', {
-              callSid,
-              chunkIndex: i + 1, // Next chunk that would have been sent
-              chunksSent: i + 1,
-              totalChunks,
-              bytesSent: totalBytesSent,
-              delayMs: chunkDelayMs,
-              note: 'User interrupted - stopping before sending next chunk',
-            });
-            break; // Stop sending more chunks
-          }
-        }
-      }
-      
-      // Check if audio was interrupted
-      const finalBridge = activeBridges.get(callSid);
-      const wasInterrupted = finalBridge?.shouldStopAudio || false;
-      const actualBytesSent = totalBytesSent;
-      const actualDurationMs = Math.round((actualBytesSent / 8000) * 1000);
-      
-      if (wasInterrupted) {
-        logger.info('[VOICE_BRIDGE] 🛑 Audio interrupted by user', {
-          callSid,
-          bytesSent: actualBytesSent,
-          bytesTotal: rawAudioBuffer.length,
-          durationSentSeconds: (actualDurationMs / 1000).toFixed(1),
-          note: 'User interrupted - remaining audio not sent',
-        });
-      } else {
-        logger.info('[VOICE_BRIDGE] ✅ All audio chunks sent', {
-          callSid,
-          totalChunks,
-          totalBytes: actualBytesSent,
-        });
-      }
-      
-      // Schedule STT to resume after AI finishes speaking
-      // Use actual duration of sent audio (not total)
-      const actualWaitTimeMs = actualDurationMs + dynamicBufferMs + networkProcessingBufferMs;
-      
-      setTimeout(() => {
-        if (activeBridges.has(callSid)) {
-          const currentBridge = activeBridges.get(callSid);
-          if (currentBridge && currentBridge.isAISpeaking && !currentBridge.shouldStopAudio) {
-            currentBridge.isAISpeaking = false;
-            currentBridge.aiSpeechEndTime = Date.now();
-            
-            // CRITICAL: Clear STT buffer when AI finishes speaking to prevent processing residual audio
-            if (currentBridge.sttStream && typeof currentBridge.sttStream.clear === 'function') {
-              currentBridge.sttStream.clear();
-              logger.debug('[VOICE_BRIDGE] Cleared STT buffer - AI finished speaking, ready for user input', { callSid });
-            }
-            
-            // Immediately allow processing new transcripts (echo filtering will handle false positives)
-            // Reduced delay - echo filtering in handleSTTResult is sufficient
-            const postSpeechDelayMs = 500; // Reduced from 1500ms - echo filtering handles the rest
-            
-            // Set isWaitingForResponse to false immediately (echo filtering will prevent false triggers)
-            currentBridge.isWaitingForResponse = false;
-            
-            // Small delay to log the state change
-            setTimeout(() => {
-              if (activeBridges.has(callSid)) {
-                const finalBridge = activeBridges.get(callSid);
-                if (finalBridge) {
-                  logger.debug('[VOICE_BRIDGE] Ready for user input', {
-                    callSid,
-                    timeSinceAIFinished: Date.now() - (finalBridge.aiSpeechEndTime || 0),
-                    note: 'isWaitingForResponse is false - STT will process user input',
-                  });
-                }
-              }
-            }, postSpeechDelayMs);
-            
-            const actualWaitTime = Date.now() - audioSendTime;
-            logger.info('[VOICE_BRIDGE] ✅ AI finished speaking - ready for input', {
-              callSid,
-              estimatedDurationMs: actualDurationMs,
-              totalWaitTimeMs: actualWaitTimeMs,
-              actualWaitTime,
-              postSpeechDelayMs,
-              wasInterrupted,
-            });
-          }
-        }
-      }, actualWaitTimeMs);
-    };
-    
-    // Start sending chunks (don't await - let it run in background)
-    sendChunks().catch((error: any) => {
-      logger.error('[VOICE_BRIDGE] Error sending audio chunks', {
+    if (!success) {
+      logger.error('[VOICE_BRIDGE_OPTIMIZED] Failed to send audio', {
         callSid,
-        error: error.message,
+        totalBytes: completeAudioBuffer.length,
       });
-      const errorBridge = activeBridges.get(callSid);
-      if (errorBridge) {
-        errorBridge.isAISpeaking = false;
-        errorBridge.isWaitingForResponse = false;
-      }
+      bridge.isAISpeaking = false;
+      bridge.isWaitingForResponse = false;
+      return;
+    }
+
+    const totalBytesSent = completeAudioBuffer.length;
+    const actualDurationMs = Math.round((totalBytesSent / 8000) * 1000);
+    
+    logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ Audio sent (as per ElevenLabs sample)', {
+      callSid,
+      totalBytes: totalBytesSent,
+      estimatedDurationSeconds: (actualDurationMs / 1000).toFixed(1),
+      note: 'Following ElevenLabs sample exactly - collected all chunks before sending',
     });
+    
+    // Schedule STT to resume after AI finishes speaking
+    const dynamicBufferMs = actualDurationMs < 3000 
+      ? Math.max(500, Math.round(actualDurationMs * 0.3))
+      : actualDurationMs < 10000
+      ? Math.max(1000, Math.round(actualDurationMs * 0.15))
+      : 2000;
+    const networkProcessingBufferMs = 200;
+    const totalWaitTimeMs = actualDurationMs + dynamicBufferMs + networkProcessingBufferMs;
+    
+    setTimeout(() => {
+      if (activeBridges.has(callSid)) {
+        const currentBridge = activeBridges.get(callSid);
+        if (currentBridge && currentBridge.isAISpeaking && !currentBridge.shouldStopAudio) {
+          currentBridge.isAISpeaking = false;
+          currentBridge.aiSpeechEndTime = Date.now();
+          
+          // CRITICAL: Ignore transcripts temporarily when AI finishes speaking
+          // Official SDK doesn't have a clear() method, so we use timestamp-based filtering
+          if (currentBridge.sttConnection) {
+            currentBridge.ignoreTranscriptsUntil = Date.now() + 500; // Ignore transcripts for 500ms
+            logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcripts temporarily - AI finished speaking', { callSid });
+          }
+          
+          // Immediately allow processing new transcripts (echo filtering will handle false positives)
+          const postSpeechDelayMs = 500;
+          currentBridge.isWaitingForResponse = false;
+          
+          setTimeout(() => {
+            if (activeBridges.has(callSid)) {
+              const finalBridge = activeBridges.get(callSid);
+              if (finalBridge) {
+                logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ready for user input', {
+                  callSid,
+                  timeSinceAIFinished: Date.now() - (finalBridge.aiSpeechEndTime || 0),
+                  note: 'isWaitingForResponse is false - STT will process user input',
+                });
+              }
+            }
+          }, postSpeechDelayMs);
+          
+          logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ AI finished speaking - ready for input', {
+            callSid,
+            estimatedDurationMs: actualDurationMs,
+            totalWaitTimeMs,
+            wasInterrupted: currentBridge.shouldStopAudio || false,
+          });
+        }
+      }
+    }, totalWaitTimeMs);
   } catch (error: any) {
-    logger.error('[VOICE_BRIDGE] ❌ Exception while converting text to audio', {
+    logger.error('[VOICE_BRIDGE_OPTIMIZED] ❌ Exception while converting text to audio', {
       callSid,
       error: error.message,
       stack: error.stack,
@@ -1100,11 +1078,23 @@ export function stopVoiceCallBridge(callSid: string): void {
     return;
   }
 
-  logger.info('[VOICE_BRIDGE] Stopping bridge', { callSid });
+  logger.info('[VOICE_BRIDGE_OPTIMIZED] Stopping bridge', { callSid });
 
-  // Close STT stream if open
-  if (bridge.sttStream) {
-    bridge.sttStream.close();
+  // Close STT connection using official SDK
+  if (bridge.sttConnection) {
+    try {
+      // Send final commit before closing
+      bridge.sttConnection.commit();
+      bridge.sttConnection.close();
+      logger.info('[VOICE_BRIDGE_OPTIMIZED] ElevenLabs STT connection closed', {
+        callSid,
+      });
+    } catch (error: any) {
+      logger.error('[VOICE_BRIDGE_OPTIMIZED] Error closing STT connection', {
+        callSid,
+        error: error.message,
+      });
+    }
   }
 
   // Clear transcript timeout
@@ -1140,7 +1130,7 @@ async function preloadContextForCall(
       loadedAt: loadStartTime,
     };
   } catch (error: any) {
-    logger.error('[VOICE_BRIDGE] Error preloading context', {
+    logger.error('[VOICE_BRIDGE_OPTIMIZED] Error preloading context', {
       error: error.message,
       accountId,
       contactId,
@@ -1167,4 +1157,3 @@ export function getActiveBridge(callSid: string): VoiceCallBridge | undefined {
 export function getAllActiveBridges(): VoiceCallBridge[] {
   return Array.from(activeBridges.values());
 }
-

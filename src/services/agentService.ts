@@ -20,7 +20,8 @@ export async function sendMessageToAgent(
   contactId?: string,
   accountId?: string,
   maxRetries: number = 3,
-  campaignInstructions?: string // Campaign instructions for AI context
+  campaignInstructions?: string, // Campaign instructions for AI context
+  preloadedContext?: { systemPrompt: string; conversationHistory: Array<{ role: 'user' | 'assistant'; content: string; timestamp: Date }> }
 ): Promise<AgentResponse> {
   const openAIKey = (env.OPENAI_API_KEY || '').trim();
   const hasOpenAIKey = openAIKey.length > 0;
@@ -52,7 +53,8 @@ export async function sendMessageToAgent(
       contactId,
       accountId,
       maxRetries,
-      campaignInstructions
+      campaignInstructions,
+      preloadedContext
     );
 
     if (response.success && response.response) {
