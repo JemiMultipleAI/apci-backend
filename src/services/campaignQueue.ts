@@ -494,6 +494,37 @@ campaignQueue.process('campaign-message', 1, async (job) => {
             ? campaign.custom_introduction
             : undefined;
 
+          // OPTIMIZATION: Start preloading context BEFORE initiating call
+          // This gives us a head start while Twilio is connecting (reduces latency)
+          if (useAgent && effectiveAccountId && contactId) {
+            // Dynamically import the correct bridge module based on VOICE_BRIDGE_MODE
+            const bridgeModule = env.VOICE_BRIDGE_MODE === 'optimized' 
+              ? './voiceCallBridgeOptimized' 
+              : './voiceCallBridge';
+            
+            import(bridgeModule).then(({ preloadContextBeforeCall }) => {
+              preloadContextBeforeCall(
+                effectiveAccountId,
+                contactId,
+                campaign.instructions
+              ).catch((error: any) => {
+                logger.warn('[CAMPAIGN_QUEUE] Failed to start preload before call', {
+                  contactId,
+                  accountId: effectiveAccountId,
+                  error: error.message,
+                  note: 'Will fallback to on-demand loading',
+                });
+              });
+            }).catch((error: any) => {
+              logger.warn('[CAMPAIGN_QUEUE] Failed to import bridge module for preload', {
+                error: error.message,
+                bridgeMode: env.VOICE_BRIDGE_MODE,
+                note: 'Will fallback to on-demand loading',
+              });
+            });
+          }
+
+          // Now initiate the call (preloading continues in background)
           result = await makeVoiceCallFromTemplate(
             contact.mobile,
             callScript, // Always undefined for instructions-based campaigns

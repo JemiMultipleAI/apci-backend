@@ -48,6 +48,14 @@ const activeBridges = new Map<string, VoiceCallBridge>();
 // Buffer for audio chunks received before bridge is ready
 const pendingAudioBuffers = new Map<string, Array<{ chunk: Buffer; timestamp: number }>>();
 
+// Cache for preloaded context (keyed by contactId + accountId for retrieval before call connects)
+const preloadedContextCache = new Map<string, PreloadedContext>();
+
+// Helper to generate cache key
+function getPreloadCacheKey(contactId: string, accountId: string): string {
+  return `${contactId}:${accountId}`;
+}
+
 /**
  * Start voice call bridge with simplified flow:
  * Twilio Audio → OpenAI STT → OpenAI Chat API → ElevenLabs TTS → Twilio Audio
@@ -132,9 +140,23 @@ export async function startVoiceCallBridge(
 
   activeBridges.set(callSid, bridge);
 
-  // Preload context asynchronously (don't block bridge initialization)
-  // This reduces latency for the first AI response significantly
-  if (accountId && contactId) {
+  // Check for preloaded context in cache first
+  const cacheKey = accountId && contactId ? getPreloadCacheKey(contactId, accountId) : null;
+  const cachedContext = cacheKey ? preloadedContextCache.get(cacheKey) : undefined;
+
+  if (cachedContext) {
+    // Use preloaded context immediately
+    bridge.preloadedContext = cachedContext;
+    preloadedContextCache.delete(cacheKey); // Clean up cache
+    logger.info('[VOICE_BRIDGE] Using preloaded context from cache', {
+      callSid,
+      hasSystemPrompt: !!cachedContext.systemPrompt,
+      historyLength: cachedContext.conversationHistory.length,
+      loadTimeMs: Date.now() - cachedContext.loadedAt,
+      note: '✅ Context was preloaded before call - zero latency!',
+    });
+  } else if (accountId && contactId) {
+    // Fallback: Preload context asynchronously (if not already cached)
     preloadContextForCall(accountId, contactId, instructions).then((context) => {
       if (activeBridges.has(callSid)) {
         const bridge = activeBridges.get(callSid);
@@ -1152,6 +1174,57 @@ async function preloadContextForCall(
       loadedAt: loadStartTime,
     };
   }
+}
+
+/**
+ * Export function to preload context before call (called from campaignQueue)
+ * This starts preloading while Twilio call is connecting, reducing latency
+ */
+export async function preloadContextBeforeCall(
+  accountId: string,
+  contactId: string,
+  instructions?: string
+): Promise<void> {
+  const cacheKey = getPreloadCacheKey(contactId, accountId);
+  
+  // Don't preload if already cached
+  if (preloadedContextCache.has(cacheKey)) {
+    logger.debug('[VOICE_BRIDGE] Context already preloaded', {
+      contactId,
+      accountId,
+      cacheKey,
+    });
+    return;
+  }
+
+  logger.info('[VOICE_BRIDGE] Starting preload before call', {
+    contactId,
+    accountId,
+    hasInstructions: !!instructions,
+    note: 'Preloading context while Twilio call is connecting - reduces latency',
+  });
+
+  // Start preloading (don't await - let it run in background)
+  preloadContextForCall(accountId, contactId, instructions)
+    .then((context) => {
+      preloadedContextCache.set(cacheKey, context);
+      logger.info('[VOICE_BRIDGE] Context preloaded before call', {
+        contactId,
+        accountId,
+        hasSystemPrompt: !!context.systemPrompt,
+        historyLength: context.conversationHistory.length,
+        loadTimeMs: Date.now() - context.loadedAt,
+        note: 'Context ready - will be used when bridge connects',
+      });
+    })
+    .catch((error: any) => {
+      logger.warn('[VOICE_BRIDGE] Failed to preload context before call', {
+        contactId,
+        accountId,
+        error: error.message,
+        note: 'Will fallback to on-demand loading',
+      });
+    });
 }
 
 /**
