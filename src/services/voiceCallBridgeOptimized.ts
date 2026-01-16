@@ -423,10 +423,14 @@ export async function handleInboundAudio(
     return;
   }
 
-  // Don't block audio from STT - allow interruption detection
-  // Echo filtering happens in handleSTTResult based on timing
-  // We need to keep audio flowing to STT so user can interrupt
-  // Note: Audio will be filtered in handleSTTResult if it's echo
+  // CRITICAL: Don't send audio to STT while AI is speaking (per ElevenLabs docs)
+  // This prevents echo from agent's voice being picked up by user's microphone
+  // We allow interruption by resuming STT after a short delay (handled in sendAgentResponseAsAudio)
+  if (bridge.isAISpeaking) {
+    // Don't send to STT while AI is speaking - prevents echo
+    // Audio will resume automatically when AI finishes (via ignoreTranscriptsUntil mechanism)
+    return;
+  }
 
   // Send audio to STT connection using official SDK
   if (bridge.sttConnection) {
@@ -578,105 +582,35 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       return;
     }
 
-    // Duplicate transcript detection: ignore if same transcript within 10 seconds (increased from 5s)
-    // This catches repeated echo like "Thank you." appearing multiple times after AI responses
-    if (bridge.lastTranscriptText === finalText && 
-        bridge.lastTranscriptTime && 
-        (now - bridge.lastTranscriptTime) < 10000) {
-      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring duplicate transcript', {
-        callSid,
-        text: finalText,
-        timeSinceLastTranscript: now - (bridge.lastTranscriptTime || 0),
-        note: 'Same transcript received within 10 seconds - likely duplicate/echo',
-      });
-      return;
-    }
-
-    // Enhanced echo filtering: check time since AI finished speaking
-    const timeSinceAIFinished = bridge.aiSpeechEndTime 
-      ? now - bridge.aiSpeechEndTime 
-      : Infinity;
+    // NOTE: For optimized version using ElevenLabs STT with VAD (Voice Activity Detection),
+    // echo suppression is handled by ElevenLabs. We trust their VAD to filter echoes.
+    // Removed aggressive echo filtering - ElevenLabs STT should handle this better.
     
-    // If AI is still speaking (isAISpeaking = true), allow interruption
-    // Don't filter as echo if user is actively interrupting with substantial text
-    const isUserInterrupting = bridge.isAISpeaking && finalText.trim().length > 10;
-    
-    // List of common echo phrases that match AI responses
-    // When AI says "You're welcome!", echo often becomes "Thank you." or "you"
-    // These are legitimate user responses but become echo when transcribed too quickly after AI speech
-    // Note: Removed 'hello' and 'hi' - these are legitimate user greetings, not echo
-    const echoPhrases = ['thank you', 'thank you.', 'thanks', 'thanks.', 'welcome'];
-    const singleWordEchoPhrases = ['you', 'wel', 'come', 'than', 'thank']; // Very short fragments only
-    const normalizedTextForEcho = finalText.toLowerCase().trim();
-    
-    // For phrases: exact match or starts/ends with phrase
-    const matchesPhrase = echoPhrases.some(phrase => 
-      normalizedTextForEcho === phrase || 
-      normalizedTextForEcho.startsWith(phrase + ' ') ||
-      normalizedTextForEcho.endsWith(' ' + phrase) ||
-      normalizedTextForEcho.includes(' ' + phrase + ' ')
-    );
-    
-    // For single words: only match if text is very short (likely echo fragment)
-    // Don't match "you" in "Yeah, you can tell me more" - that's legitimate speech
-    const matchesSingleWord = finalText.trim().length <= 10 && singleWordEchoPhrases.some(phrase => {
-      // Use word boundaries - match standalone word only
-      const wordBoundaryRegex = new RegExp(`\\b${phrase}\\b`, 'i');
-      return wordBoundaryRegex.test(normalizedTextForEcho);
-    });
-    
-    const isEchoPhrase = matchesPhrase || matchesSingleWord;
-    
-    // Extended echo window for specific phrases (like "thank you" after "you're welcome")
-    // These phrases can appear as echo even 15-20 seconds after AI speaks due to buffering/delays
-    // Use longer window for echo phrases (20 seconds) vs normal phrases (3 seconds)
-    const echoWindowMs = isEchoPhrase ? 20000 : 3000; // 20 seconds for echo phrases, 3 seconds for others
-    const isWithinEchoWindow = timeSinceAIFinished < echoWindowMs;
-    
-    // Don't filter if user is actively interrupting (substantial text while AI is speaking)
-    if (isUserInterrupting) {
-      logger.info('[VOICE_BRIDGE_OPTIMIZED] User interrupting - allowing through', {
-        callSid,
-        text: finalText.substring(0, 50),
-        note: 'User is interrupting AI - not filtering as echo',
-      });
-      // Continue to process - don't return here
-    } else if (isWithinEchoWindow && isEchoPhrase) {
-      // Only filter echo phrases if NOT interrupting
-      // Also don't filter if text is substantial (longer sentences are legitimate)
-      const isSubstantialText = finalText.trim().length > 15;
-      
-      if (isSubstantialText) {
-        logger.debug('[VOICE_BRIDGE_OPTIMIZED] Allowing substantial text despite echo phrase match', {
-          callSid,
-          text: finalText.substring(0, 50),
-          length: finalText.length,
-          note: 'Text is substantial - likely legitimate user input, not echo',
-        });
-        // Continue to process - don't filter substantial text
-      } else {
-        logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring likely echo phrase', {
+    // Only keep minimal filtering for obvious duplicates (same text within 1 second)
+    if (bridge.lastTranscriptText === finalText && bridge.lastTranscriptTime) {
+      const timeSinceLastTranscript = now - bridge.lastTranscriptTime;
+      if (timeSinceLastTranscript < 1000) {
+        logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring duplicate transcript', {
           callSid,
           text: finalText,
-          timeSinceAIFinished,
-          echoWindowMs,
-          note: `Phrase matches common echo pattern within ${echoWindowMs}ms of AI response - likely echo`,
+          timeSinceLastTranscript,
+          note: 'Same transcript received within 1 second - likely duplicate',
         });
         return;
       }
     }
     
-    // Also filter very short fragments within echo window (existing logic, but with extended window)
-    const isVeryShortFragment = finalText.length < 5 && finalText.length > 0;
-    if (isVeryShortFragment && isWithinEchoWindow) {
-      logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring likely echo fragment', {
-        callSid,
-        text: finalText,
-        timeSinceAIFinished,
-        note: 'Very short fragment within 3 seconds of AI response - likely echo',
-      });
-      return;
-    }
+    // Update last transcript tracking
+    bridge.lastTranscriptText = finalText;
+    bridge.lastTranscriptTime = now;
+    
+    // Continue processing - trust ElevenLabs VAD for echo suppression
+    logger.debug('[VOICE_BRIDGE_OPTIMIZED] Processing transcript (ElevenLabs VAD handles echo)', {
+      callSid,
+      text: finalText.substring(0, 50),
+      isFinal: result.isFinal,
+      note: 'Trusting ElevenLabs VAD for echo suppression',
+    });
     
     // Process legitimate transcripts (including interruptions)
     // Allow processing even if waiting for response (user can interrupt)
@@ -684,15 +618,8 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       logger.info('[VOICE_BRIDGE_OPTIMIZED] 📝 Transcript:', {
         callSid,
         text: finalText,
-        timeSinceAIFinished: timeSinceAIFinished !== Infinity ? timeSinceAIFinished : 'N/A',
-        note: timeSinceAIFinished !== Infinity && timeSinceAIFinished < 3000 
-          ? 'Within echo window but passed filters - likely legitimate' 
-          : 'Outside echo window - definitely legitimate',
+        note: 'Processing transcript - ElevenLabs VAD handles echo suppression',
       });
-      
-      // Update last transcript tracking
-      bridge.lastTranscriptText = finalText;
-      bridge.lastTranscriptTime = now;
       bridge.lastTranscriptProcessedTime = now; // Track when we processed this transcript (for cooldown)
       
       bridge.pendingTranscript = '';
