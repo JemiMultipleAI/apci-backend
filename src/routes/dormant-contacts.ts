@@ -10,6 +10,7 @@ import { sendEmailFromTemplate } from '../services/email';
 import { sendSMSFromTemplate } from '../services/sms';
 import { makeVoiceCallFromTemplate } from '../services/voice';
 import { createWebhookToken, generateReplyToEmail } from '../services/webhookTokens';
+import { campaignQueue, CampaignJobData } from '../services/campaignQueue';
 
 const router = Router();
 
@@ -156,6 +157,7 @@ const reactivateSchema = z.object({
   days_inactive: z.number().int().positive().optional().default(90),
   scheduled_date: z.string().optional(), // ISO date string
   scheduled_time: z.string().optional(), // Time string (HH:mm)
+  instructions: z.string().optional(), // AI instructions for personalized content
 });
 
 router.post('/reactivate', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
@@ -276,10 +278,52 @@ Be warm, genuine, and avoid being pushy. Focus on rebuilding the relationship.`;
 
     // Execute the campaign using the campaign queue service
     // The campaign queue will use the instructions field for AI-generated content
-    const { addCampaignJobs } = await import('../services/campaignQueue');
+    const channel = validatedData.channel === 'multi' ? 'email' : validatedData.channel; // Default to email for multi
     
-    // Queue campaign jobs for execution
-    await addCampaignJobs(campaign.id, contacts.map((c: any) => c.id), userCompanyId || undefined);
+    // Queue campaign jobs for each contact
+    const jobPromises = contacts.map((contact: any) => {
+      const jobData: CampaignJobData = {
+        campaignId: campaign.id,
+        contactId: contact.id,
+        channel: channel as 'email' | 'sms' | 'call',
+        variables: {},
+        userId: userId || undefined,
+        accountId: userCompanyId || undefined,
+      };
+
+      return campaignQueue.add(
+        'campaign-message',
+        jobData,
+        {
+          jobId: `campaign-${campaign.id}-${channel}-${contact.id}-${Date.now()}-${Math.random()}`,
+        }
+      ).catch((error: any) => {
+        logger.error('[DORMANT_CONTACTS] Failed to queue job', {
+          campaignId: campaign.id,
+          contactId: contact.id,
+          channel,
+          error: error.message,
+        });
+        return null;
+      });
+    });
+
+    // Wait for all jobs to be queued
+    const queuedJobs = await Promise.all(jobPromises);
+    const successfulJobs = queuedJobs.filter(job => job !== null);
+
+    // Update campaign metadata with total jobs
+    const updatedMetadata = {
+      ...campaignMetadata,
+      total_jobs: successfulJobs.length,
+      completed_jobs: 0,
+      failed_jobs: 0,
+    };
+    
+    await query(
+      'UPDATE campaigns SET metadata = $1 WHERE id = $2',
+      [JSON.stringify(updatedMetadata), campaign.id]
+    );
 
     // Return success response - actual execution happens via queue
     return res.json({
@@ -287,7 +331,7 @@ Be warm, genuine, and avoid being pushy. Focus on rebuilding the relationship.`;
       data: {
         campaign_id: campaign.id,
         total: contacts.length,
-        queued: contacts.length,
+        queued: successfulJobs.length,
         message: 'Campaign queued for execution',
       },
     });
