@@ -42,6 +42,13 @@ interface VoiceCallBridge {
   preloadedContext?: PreloadedContext; // Preloaded CRM context to reduce latency
   shouldStopAudio?: boolean; // Flag to stop sending audio chunks (for user interruption)
   ignoreTranscriptsUntil?: number; // Timestamp until which to ignore transcripts (for clearing buffer)
+  lastAISpeechText?: string; // Store the text the AI just spoke (for echo detection)
+  recentTranscripts?: Array<{ text: string; time: number }>; // Track recent transcripts for similarity detection
+  processedPartialTranscripts?: Array<{ text: string; time: number }>; // Track partial transcripts that were processed (to avoid duplicate final processing)
+  pendingAgentRequest?: { text: string; timestamp: number }; // Track pending agent request (for race condition prevention)
+  lastInterruptionTime?: number; // Track last interruption time (for debouncing rapid interruptions)
+  sttReady?: boolean; // Track if STT session is ready (WebSocket connected)
+  pendingSttAudio?: Array<{ chunk: Buffer; timestamp: number }>; // Queue audio until STT is ready
 }
 
 // Store active bridges
@@ -164,39 +171,117 @@ export async function startVoiceCallBridge(
 
       sttConnection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, (transcript: any) => {
         const text = typeof transcript === 'string' ? transcript : (transcript.text || '');
+        const finalText = text.trim();
+        
         logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ ElevenLabs COMMITTED transcript', {
           callSid,
-          text,
+          text: finalText,
           confidence: transcript.confidence,
           note: 'Final transcript from ElevenLabs STT',
         });
         
-        if (text && text.trim()) {
-          handleSTTResult(callSid, {
-            text: text.trim(),
-            isFinal: true,
-            confidence: transcript.confidence,
-          });
+        if (!finalText) {
+          return; // Ignore empty transcripts
         }
+
+        // FILTER: Basic non-English filtering for COMMITTED_TRANSCRIPT (no word-level data)
+        // Filter short non-English transcripts (likely false positives)
+        const hasNonASCII = /[^\x00-\x7F]/.test(finalText);
+        const MIN_TEXT_LENGTH = 8; // Minimum text length for non-English
+        
+        if (hasNonASCII && finalText.length < MIN_TEXT_LENGTH) {
+          logger.warn('[VOICE_BRIDGE_OPTIMIZED] ⚠️ Filtering short non-English transcript', {
+            callSid,
+            text: finalText,
+            textLength: finalText.length,
+            note: 'Short non-English transcript - likely noise/echo, filtering out',
+          });
+          return; // Filter out short non-English
+        }
+        
+        // Process the transcript
+        handleSTTResult(callSid, {
+          text: finalText,
+          isFinal: true,
+          confidence: transcript.confidence,
+        });
       });
 
       sttConnection.on(RealtimeEvents.COMMITTED_TRANSCRIPT_WITH_TIMESTAMPS, (transcript: any) => {
         const text = typeof transcript === 'string' ? transcript : (transcript.text || '');
+        const finalText = text.trim();
+        
         logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ ElevenLabs COMMITTED transcript with timestamps', {
           callSid,
-          text,
+          text: finalText,
           words: transcript.words,
           confidence: transcript.confidence,
           note: 'Final transcript with word-level timestamps from ElevenLabs STT',
         });
         
-        if (text && text.trim()) {
-          handleSTTResult(callSid, {
-            text: text.trim(),
-            isFinal: true,
-            confidence: transcript.confidence,
-          });
+        if (!finalText) {
+          return; // Ignore empty transcripts
         }
+
+        // FILTER: Combined threshold approach for non-English transcripts
+        // Filter low-quality non-English transcripts (likely false positives from noise/echo)
+        // But allow legitimate non-English if it's longer, higher confidence, or longer duration
+        const hasNonASCII = /[^\x00-\x7F]/.test(finalText);
+        
+        if (hasNonASCII && transcript.words && transcript.words.length > 0) {
+          // Calculate average logprob (lower = less confidence)
+          const wordsWithLogprob = transcript.words.filter((w: any) => w.logprob !== undefined && w.logprob !== null);
+          const avgLogprob = wordsWithLogprob.length > 0
+            ? wordsWithLogprob.reduce((sum: number, w: any) => sum + w.logprob, 0) / wordsWithLogprob.length
+            : -Infinity;
+          
+          // Calculate total duration
+          const firstWord = transcript.words[0];
+          const lastWord = transcript.words[transcript.words.length - 1];
+          const totalDuration = lastWord && firstWord ? (lastWord.end - firstWord.start) : 0;
+          
+          // Filter if: non-English AND (low confidence OR short duration OR short text)
+          const CONFIDENCE_THRESHOLD = -10.0; // Average logprob threshold
+          const MIN_DURATION_SEC = 0.5; // Minimum duration in seconds
+          const MIN_TEXT_LENGTH = 8; // Minimum text length
+          
+          const shouldFilter = avgLogprob < CONFIDENCE_THRESHOLD || 
+                              totalDuration < MIN_DURATION_SEC || 
+                              finalText.length < MIN_TEXT_LENGTH;
+          
+          if (shouldFilter) {
+            logger.warn('[VOICE_BRIDGE_OPTIMIZED] ⚠️ Filtering low-quality non-English transcript', {
+              callSid,
+              text: finalText,
+              textLength: finalText.length,
+              avgLogprob: avgLogprob.toFixed(2),
+              totalDuration: totalDuration.toFixed(2),
+              wordCount: transcript.words.length,
+              reason: avgLogprob < CONFIDENCE_THRESHOLD ? 'low confidence' :
+                      totalDuration < MIN_DURATION_SEC ? 'short duration' :
+                      'short text',
+              note: 'ElevenLabs STT auto-detected non-English with low quality - likely noise/echo, filtering out',
+            });
+            return; // Filter out low-quality non-English
+          } else {
+            // High-quality non-English - allow it (legitimate multilingual user)
+            logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ Allowing high-quality non-English transcript', {
+              callSid,
+              text: finalText.substring(0, 50),
+              textLength: finalText.length,
+              avgLogprob: avgLogprob.toFixed(2),
+              totalDuration: totalDuration.toFixed(2),
+              note: 'Non-English transcript meets quality thresholds - likely legitimate user speech',
+            });
+          }
+        }
+        
+        // Process the transcript
+        handleSTTResult(callSid, {
+          text: finalText,
+          isFinal: true,
+          confidence: transcript.confidence,
+        });
       });
 
       sttConnection.on(RealtimeEvents.ERROR, (error: any) => {
@@ -423,13 +508,19 @@ export async function handleInboundAudio(
     return;
   }
 
-  // CRITICAL: Don't send audio to STT while AI is speaking (per ElevenLabs docs)
-  // This prevents echo from agent's voice being picked up by user's microphone
-  // We allow interruption by resuming STT after a short delay (handled in sendAgentResponseAsAudio)
-  if (bridge.isAISpeaking) {
-    // Don't send to STT while AI is speaking - prevents echo
-    // Audio will resume automatically when AI finishes (via ignoreTranscriptsUntil mechanism)
-    return;
+  // CRITICAL: Allow interruption after a short delay to prevent immediate echo
+  // But still allow user to interrupt AI after echo window passes
+  const ECHO_PREVENTION_DELAY_MS = 500; // Reduced from 800ms for faster interruption detection
+
+  if (bridge.isAISpeaking && bridge.aiSpeechStartTime) {
+    const timeSinceAIStarted = Date.now() - bridge.aiSpeechStartTime;
+    
+    if (timeSinceAIStarted < ECHO_PREVENTION_DELAY_MS) {
+      // Block audio immediately after AI starts (prevents immediate echo)
+      return;
+    }
+    // After delay, allow audio to flow - enables interruption detection
+    // Echo filtering in handleSTTResult will filter any remaining echo
   }
 
   // Send audio to STT connection using official SDK
@@ -497,28 +588,44 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       ? Date.now() - bridge.aiSpeechStartTime 
       : Infinity;
     
+    // Whitelist common interruption keywords (allow even if short)
+    const INTERRUPTION_KEYWORDS = ['yes', 'no', 'stop', 'wait', 'hold', 'pause', 'enough', 'okay', 'ok', 'sure', 'right', 'correct'];
+    const textLower = result.text.trim().toLowerCase();
+    const isInterruptionKeyword = INTERRUPTION_KEYWORDS.some(keyword => 
+      textLower === keyword || textLower.startsWith(keyword + ' ') || textLower.includes(' ' + keyword + ' ')
+    );
+    
     // Allow interruption if:
-    // 1. User has been speaking for a while (substantial text, not just echo)
-    // 2. OR it's been more than 2 seconds since AI started (echo window passed)
-    const isLikelyUserSpeech = result.isFinal && 
-      result.text.trim().length > 10 && // Substantial text (not just "you" or "thank")
-      (timeSinceAIStarted > 2000 || result.text.trim().length > 20); // Either time passed or substantial text
+    // 1. Contains interruption keyword (even if short)
+    // 2. OR substantial text (>5 chars, lowered from 10)
+    // 3. OR it's been >1 second since AI started AND text is >3 chars (lowered thresholds)
+    const isLikelyUserSpeech = result.isFinal && (
+      isInterruptionKeyword || // Allow keywords even if short
+      result.text.trim().length > 5 || // Lowered from 10
+      (timeSinceAIStarted > 1000 && result.text.trim().length > 3) // Lowered from 2000ms and 20 chars
+    );
     
     if (!isLikelyUserSpeech) {
       logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcript - likely echo while AI speaking', {
         callSid,
         text: result.text.substring(0, 50),
+        textLength: result.text.trim().length,
         timeSinceAIStarted,
-        note: 'Filtering echo - user can interrupt with longer speech',
+        isInterruptionKeyword,
+        note: 'Filtering echo - user can interrupt with keywords or longer speech',
       });
       return;
     }
     
     // User is interrupting - stop AI and process their input
+    const interruptionDetectionTime = Date.now();
     logger.info('[VOICE_BRIDGE_OPTIMIZED] 🛑 User interrupting AI', {
       callSid,
       text: result.text.substring(0, 100),
+      textLength: result.text.trim().length,
       timeSinceAIStarted,
+      isInterruptionKeyword,
+      detectionLatencyMs: interruptionDetectionTime - (bridge.aiSpeechStartTime || 0),
       note: 'Processing user input immediately - stopping audio chunks',
     });
     
@@ -526,6 +633,9 @@ function handleSTTResult(callSid: string, result: STTResult): void {
     bridge.shouldStopAudio = true;
     bridge.isAISpeaking = false;
     bridge.aiSpeechEndTime = Date.now();
+    
+    // Track interruption for analytics (debouncing)
+    bridge.lastInterruptionTime = Date.now();
   }
 
   if (result.isFinal) {
@@ -627,10 +737,22 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       
       // If AI was speaking, stop it
       if (bridge.isAISpeaking) {
+        const interruptionTime = Date.now();
+        const timeSinceAIStarted = bridge.aiSpeechStartTime 
+          ? interruptionTime - bridge.aiSpeechStartTime 
+          : 0;
+        
         bridge.shouldStopAudio = true;
         bridge.isAISpeaking = false;
-        bridge.aiSpeechEndTime = Date.now();
-        logger.info('[VOICE_BRIDGE_OPTIMIZED] 🛑 Stopped AI - user interrupted', { callSid });
+        bridge.aiSpeechEndTime = interruptionTime;
+        
+        logger.info('[VOICE_BRIDGE_OPTIMIZED] 🛑 Stopped AI - user interrupted', {
+          callSid,
+          interruptionText: finalText.substring(0, 50),
+          timeSinceAIStarted,
+          detectionLatencyMs: timeSinceAIStarted,
+          note: 'User successfully interrupted AI - audio chunks will stop',
+        });
       }
       
       sendTextToAgent(callSid, finalText);
