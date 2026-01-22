@@ -5,6 +5,7 @@ import { testConnection } from './db/connection';
 import { errorHandler } from './middleware/errorHandler';
 import { notFoundHandler } from './middleware/notFoundHandler';
 import { requestLogger } from './middleware/requestLogger';
+import { logger } from './utils/logger';
 import contactsRouter from './routes/contacts';
 import accountsRouter from './routes/accounts';
 import dealsRouter from './routes/deals';
@@ -320,6 +321,15 @@ const startServer = async () => {
     server.on('upgrade', (request, socket, head) => {
       const pathname = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`).pathname;
       
+      logger.info('[WEBSOCKET] Upgrade request received', {
+        pathname,
+        url: request.url,
+        headers: {
+          origin: request.headers.origin,
+          'user-agent': request.headers['user-agent']?.substring(0, 50),
+        },
+      });
+      
       // Route to Twilio Media Streams WebSocket
       if (pathname === '/api/webhooks/twilio/media-streams') {
         if (mediaStreamsWss) {
@@ -335,16 +345,19 @@ const startServer = async () => {
       // Route to general WebSocket server
       if (pathname === '/ws') {
         if (generalWss) {
+          logger.info('[WEBSOCKET] Routing to general WebSocket server', { pathname, url: request.url });
           generalWss.handleUpgrade(request, socket, head, (ws: any) => {
             generalWss.emit('connection', ws, request);
           });
         } else {
+          logger.error('[WEBSOCKET] General WebSocket server not initialized', { pathname });
           socket.destroy();
         }
         return;
       }
       
       // For all other paths, close the connection (not a WebSocket path we handle)
+      logger.warn('[WEBSOCKET] Unknown WebSocket path', { pathname, url: request.url });
       socket.destroy();
     });
     
