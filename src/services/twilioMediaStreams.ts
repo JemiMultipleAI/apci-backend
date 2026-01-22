@@ -33,7 +33,6 @@ export interface MediaStreamConnection {
   accountSid: string;
   tracks: string[];
   connectedAt: Date;
-  lastMediaTimestamp?: number; // Track last timestamp sent (incremental, in milliseconds) - kept for potential future use
   customParameters?: Record<string, string>;
 }
 
@@ -139,7 +138,6 @@ export function handleMediaStreamConnection(ws: WebSocket, req: any): void {
               accountSid: message.start.accountSid,
               tracks: message.start.tracks || [],
               connectedAt: new Date(),
-              lastMediaTimestamp: 0, // Initialize timestamp counter (incremental, in milliseconds) - kept for potential future use
               customParameters: startCustomParams,
             };
             activeStreams.set(message.start.callSid, connection);
@@ -450,14 +448,14 @@ export function sendAudioToStream(callSid: string, audioChunk: Buffer): boolean 
     const chunkNumber = (connection as any).chunkCount;
 
     // Twilio Media Streams format for sending outbound audio
-    // Based on ElevenLabs Twilio integration guide: https://elevenlabs.io/docs/developers/guides/cookbooks/text-to-speech/twilio
-    // For bidirectional streams (Connect.Stream), we specify 'outbound' track in media message for outbound audio
+    // Per official Twilio docs: https://www.twilio.com/docs/voice/media-streams/websocket-messages#send-a-media-message
+    // Only requires: event, streamSid, and media.payload
+    // NO timestamp or track fields needed - Twilio buffers and plays messages in order received
     const mediaMessage = {
       event: 'media',
       streamSid: connection.streamSid || connection.callSid,
       media: {
         payload: base64Audio, // Base64-encoded μ-law 8kHz audio
-        track: 'outbound', // Specify outbound track for outbound audio (to caller)
       },
     };
 
@@ -478,6 +476,7 @@ export function sendAudioToStream(callSid: string, audioChunk: Buffer): boolean 
           hasPayload: !!mediaMessage.media.payload,
           payloadLength: mediaMessage.media.payload.length,
           payloadPreview: mediaMessage.media.payload.substring(0, 60) + '...',
+          note: 'Per Twilio docs: only event, streamSid, and media.payload are required',
         },
         audioData: {
           rawChunkSize: audioChunk.length,
@@ -503,7 +502,7 @@ export function sendAudioToStream(callSid: string, audioChunk: Buffer): boolean 
         base64Size: base64Audio.length,
         isValidMuLaw: isValidMuLaw,
         websocketState: connection.ws.readyState === 1 ? 'OPEN' : `STATE_${connection.ws.readyState}`,
-        note: 'Twilio expects μ-law 8kHz audio in base64 format - messages are buffered and played in order',
+        note: 'Twilio expects μ-law 8kHz audio in base64 format - messages are buffered and played in order received',
       });
     }
     
