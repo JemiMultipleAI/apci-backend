@@ -271,29 +271,45 @@ export async function startVoiceCallBridge(
           const lastWord = transcript.words[transcript.words.length - 1];
           const totalDuration = lastWord && firstWord ? (lastWord.end - firstWord.start) : 0;
           
-          // Filter if: non-English AND (low confidence OR short duration OR short text)
-          const CONFIDENCE_THRESHOLD = -10.0; // Average logprob threshold
-          const MIN_DURATION_SEC = 0.5; // Minimum duration in seconds
-          const MIN_TEXT_LENGTH = 8; // Minimum text length
+          // Stricter confidence threshold for non-English (primary filter)
+          // Non-English transcripts with very low confidence are almost always noise/echo
+          const STRICT_CONFIDENCE_THRESHOLD = -5.0; // Stricter: was -10.0, now -5.0
           
-          const shouldFilter = avgLogprob < CONFIDENCE_THRESHOLD || 
-                              totalDuration < MIN_DURATION_SEC || 
-                              finalText.length < MIN_TEXT_LENGTH;
-          
-          if (shouldFilter) {
-            logger.warn('[VOICE_BRIDGE_OPTIMIZED] ⚠️ Filtering low-quality non-English transcript', {
+          // If confidence is very low, filter immediately (regardless of length/duration)
+          if (avgLogprob < STRICT_CONFIDENCE_THRESHOLD) {
+            logger.warn('[VOICE_BRIDGE_OPTIMIZED] ⚠️ Filtering low-confidence non-English transcript', {
               callSid,
               text: finalText,
               textLength: finalText.length,
               avgLogprob: avgLogprob.toFixed(2),
               totalDuration: totalDuration.toFixed(2),
               wordCount: transcript.words.length,
-              reason: avgLogprob < CONFIDENCE_THRESHOLD ? 'low confidence' :
-                      totalDuration < MIN_DURATION_SEC ? 'short duration' :
-                      'short text',
-              note: 'ElevenLabs STT auto-detected non-English with low quality - likely noise/echo, filtering out',
+              reason: 'low confidence',
+              note: 'Non-English transcript with very low confidence - likely noise/echo, filtering out',
             });
-            return; // Filter out low-quality non-English
+            return; // Filter out low-confidence non-English
+          }
+          
+          // Secondary checks: if confidence is reasonable, still check length/duration
+          // But these are more lenient since confidence is the primary filter
+          const MIN_DURATION_SEC = 0.5; // Keep reasonable for legitimate short responses
+          const MIN_TEXT_LENGTH = 8; // Keep reasonable for legitimate short responses
+          
+          const shouldFilter = totalDuration < MIN_DURATION_SEC || 
+                              finalText.length < MIN_TEXT_LENGTH;
+          
+          if (shouldFilter) {
+            logger.warn('[VOICE_BRIDGE_OPTIMIZED] ⚠️ Filtering short non-English transcript', {
+              callSid,
+              text: finalText,
+              textLength: finalText.length,
+              avgLogprob: avgLogprob.toFixed(2),
+              totalDuration: totalDuration.toFixed(2),
+              wordCount: transcript.words.length,
+              reason: totalDuration < MIN_DURATION_SEC ? 'short duration' : 'short text',
+              note: 'Non-English transcript is too short - likely noise/echo, filtering out',
+            });
+            return; // Filter out short non-English
           } else {
             // High-quality non-English - allow it (legitimate multilingual user)
             logger.info('[VOICE_BRIDGE_OPTIMIZED] ✅ Allowing high-quality non-English transcript', {
@@ -1121,8 +1137,9 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
     logger.info('[VOICE_BRIDGE_OPTIMIZED] 🎤 Streaming audio with hybrid buffering (enables interruption + reliability)', {
       callSid,
       minBatchSize: '4KB (~500ms)',
+      maxBatchSize: '16KB (~2s)',
       maxBufferDelay: '100ms',
-      note: 'Buffers chunks into 4KB+ batches for reliability, sends every 100ms max for low latency, enables true interruption',
+      note: 'Buffers chunks into 4KB-16KB batches for reliability, sends every 100ms max for low latency, enables true interruption',
     });
 
     // Hybrid approach: Buffer chunks into batches for reliability, but send frequently for low latency
@@ -1137,14 +1154,48 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
       // Buffer for accumulating chunks before sending
       const audioBuffer: Buffer[] = [];
       const MIN_BATCH_SIZE = 4096; // 4KB = ~500ms of audio at 8kHz (more reliable than tiny chunks)
+      const MAX_BATCH_SIZE = 16000; // 16KB = ~2 seconds max (prevents huge batches that break delay logic)
       const MAX_BUFFER_DELAY_MS = 100; // Send buffer even if small after 100ms (for low latency)
       let lastBatchTime = Date.now();
       let bufferTimeout: NodeJS.Timeout | null = null;
+      
+      // Delay configuration - wait 70-80% of batch duration before sending next batch
+      // This creates natural pauses between batches for user response/interruption
+      // Increased from 50-60% to slow down sending and allow more time for interruption
+      const BATCH_DELAY_PERCENT_READY = 0.70; // 70% if next batch is already ready (was 0.50)
+      const BATCH_DELAY_PERCENT_BUFFERING = 0.80; // 80% if still buffering (longer pause) (was 0.60)
+      const MIN_BATCH_DELAY_MS = 400; // Minimum delay (ensures pause even for short batches) (was 200ms)
+      const MAX_BATCH_DELAY_MS = 5000; // Maximum delay (cap at 5 seconds for very large batches)
+      
+      // Track if we're currently waiting between batches
+      let isWaitingBetweenBatches = false;
 
-      // Helper to send buffered audio
-      const sendBufferedAudio = () => {
+      // Helper to calculate delay based on batch size and buffering state
+      const calculateBatchDelay = (batchSizeBytes: number, nextBatchReady: boolean): number => {
+        // Calculate batch duration in milliseconds
+        // For μ-law 8kHz: 8000 bytes = 1 second
+        const batchDurationMs = (batchSizeBytes / 8000) * 1000;
+        
+        // Use 50-60% delay (creates natural pauses for user response/interruption)
+        const delayPercent = nextBatchReady ? BATCH_DELAY_PERCENT_READY : BATCH_DELAY_PERCENT_BUFFERING;
+        const calculatedDelay = Math.round(batchDurationMs * delayPercent);
+        
+        // Apply min/max bounds
+        return Math.max(MIN_BATCH_DELAY_MS, Math.min(MAX_BATCH_DELAY_MS, calculatedDelay));
+      };
+
+      // Helper to send buffered audio (now async to support delays)
+      const sendBufferedAudio = async () => {
         const currentBridge = activeBridges.get(callSid);
         if (!currentBridge) {
+          return;
+        }
+
+        // If we're already waiting between batches, keep buffering (audio will be sent after delay)
+        // The delay will complete and check audioBuffer, so we don't need to queue separately
+        if (isWaitingBetweenBatches) {
+          // Just keep buffering - the delay will complete and sendBufferedAudio will be called again
+          // This allows interruption to happen during the delay period
           return;
         }
 
@@ -1173,36 +1224,142 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
         }
 
         // Combine buffered chunks into a batch
-        const batch = Buffer.concat(audioBuffer);
+        const allBuffered = Buffer.concat(audioBuffer);
         audioBuffer.length = 0; // Clear buffer
         
+        // CRITICAL FIX: Split large batches to respect MAX_BATCH_SIZE
+        // This prevents 522KB batches from being sent at once
+        const batchesToSend: Buffer[] = [];
+        let offset = 0;
+        while (offset < allBuffered.length) {
+          const batchSize = Math.min(MAX_BATCH_SIZE, allBuffered.length - offset);
+          batchesToSend.push(allBuffered.slice(offset, offset + batchSize));
+          offset += batchSize;
+        }
+
         // Clear timeout if set
         if (bufferTimeout) {
           clearTimeout(bufferTimeout);
           bufferTimeout = null;
         }
 
-        // Send batch to Twilio
-        const success = sendAudioToStream(callSid, batch);
-        if (success) {
-          totalBytesSent += batch.length;
-          batchCount++;
-          lastBatchTime = Date.now();
+        // Send each batch with interruption checks between them
+        for (let i = 0; i < batchesToSend.length; i++) {
+          const batch = batchesToSend[i];
           
-          logger.debug('[VOICE_BRIDGE_OPTIMIZED] Sent audio batch', {
-            callSid,
-            batchNumber: batchCount,
-            batchSize: batch.length,
-            totalBytesSent,
-            note: 'Hybrid approach: buffered chunks into batch for reliability',
-          });
-        } else {
-          logger.warn('[VOICE_BRIDGE_OPTIMIZED] Failed to send audio batch', {
-            callSid,
-            batchNumber: batchCount + 1,
-            batchSize: batch.length,
-            note: 'Stream may have closed',
-          });
+          // Check for interruption before sending each batch
+          const bridgeCheck = activeBridges.get(callSid);
+          if (!bridgeCheck || bridgeCheck.shouldStopAudio) {
+            logger.info('[VOICE_BRIDGE_OPTIMIZED] 🛑 User interrupted - stopping audio stream', {
+              callSid,
+              batchesSent: batchCount,
+              bytesSent: totalBytesSent,
+              remainingBatches: batchesToSend.length - i,
+              note: 'Stopping before sending remaining batches',
+            });
+            readableStream.destroy();
+            if (bridgeCheck) {
+              bridgeCheck.isAISpeaking = false;
+              bridgeCheck.aiSpeechEndTime = Date.now();
+            }
+            const actualDurationMs = Math.round((totalBytesSent / 8000) * 1000);
+            schedulePostSpeechCleanup(callSid, actualDurationMs, true);
+            resolve();
+            return;
+          }
+
+          // Send batch to Twilio
+          const success = sendAudioToStream(callSid, batch);
+          if (success) {
+            totalBytesSent += batch.length;
+            batchCount++;
+            lastBatchTime = Date.now();
+            
+            // CRITICAL: Check for interruption IMMEDIATELY after sending batch
+            // This catches interruptions that happen while the batch is being sent
+            const bridgeAfterSend = activeBridges.get(callSid);
+            if (!bridgeAfterSend || bridgeAfterSend.shouldStopAudio) {
+              logger.info('[VOICE_BRIDGE_OPTIMIZED] 🛑 User interrupted - stopping audio stream', {
+                callSid,
+                batchesSent: batchCount,
+                bytesSent: totalBytesSent,
+                remainingBatches: batchesToSend.length - i,
+                note: 'Stopping immediately after sending batch - interruption detected',
+              });
+              readableStream.destroy();
+              if (bridgeAfterSend) {
+                bridgeAfterSend.isAISpeaking = false;
+                bridgeAfterSend.aiSpeechEndTime = Date.now();
+              }
+              const actualDurationMs = Math.round((totalBytesSent / 8000) * 1000);
+              schedulePostSpeechCleanup(callSid, actualDurationMs, true);
+              resolve();
+              return;
+            }
+            
+            // Check if next batch is already ready (buffered chunks waiting)
+            const nextBatchReady = audioBuffer.length > 0 || i < batchesToSend.length - 1;
+            
+            // Calculate delay based on batch size and whether next batch is ready
+            const delayMs = calculateBatchDelay(batch.length, nextBatchReady);
+            
+            logger.debug('[VOICE_BRIDGE_OPTIMIZED] Sent audio batch', {
+              callSid,
+              batchNumber: batchCount,
+              batchSize: batch.length,
+              batchDurationMs: Math.round((batch.length / 8000) * 1000),
+              delayMs,
+              delayPercent: ((delayMs / ((batch.length / 8000) * 1000)) * 100).toFixed(1) + '%',
+              nextBatchReady,
+              totalBytesSent,
+              splitBatch: batchesToSend.length > 1 ? `${i + 1}/${batchesToSend.length}` : undefined,
+              note: 'Hybrid approach: buffered chunks into batch, waiting before next batch for interruption detection',
+            });
+            
+            // Wait between batches to allow interruption detection (except for last batch in split if no more buffered)
+            if (i < batchesToSend.length - 1 || nextBatchReady) {
+              isWaitingBetweenBatches = true;
+              await new Promise(resolve => setTimeout(resolve, delayMs));
+              isWaitingBetweenBatches = false;
+              
+              // Check for interruption during delay
+              const bridgeAfterDelay = activeBridges.get(callSid);
+              if (!bridgeAfterDelay || bridgeAfterDelay.shouldStopAudio) {
+                logger.info('[VOICE_BRIDGE_OPTIMIZED] 🛑 Interruption detected during batch delay', {
+                  callSid,
+                  batchesSent: batchCount,
+                  bytesSent: totalBytesSent,
+                  delayMs,
+                  note: 'User interrupted during delay between batches',
+                });
+                readableStream.destroy();
+                if (bridgeAfterDelay) {
+                  bridgeAfterDelay.isAISpeaking = false;
+                  bridgeAfterDelay.aiSpeechEndTime = Date.now();
+                }
+                const actualDurationMs = Math.round((totalBytesSent / 8000) * 1000);
+                schedulePostSpeechCleanup(callSid, actualDurationMs, true);
+                resolve();
+                return;
+              }
+            }
+          } else {
+            logger.warn('[VOICE_BRIDGE_OPTIMIZED] Failed to send audio batch', {
+              callSid,
+              batchNumber: batchCount + 1,
+              batchSize: batch.length,
+              note: 'Stream may have closed',
+            });
+            break; // Stop sending remaining batches if stream closed
+          }
+        }
+        
+        // After all batches sent, check if there's more buffered audio and send it
+        // This creates a recursive flow where each batch gets its own delay window for interruption
+        if (audioBuffer.length > 0) {
+          // Recursively call sendBufferedAudio - this will send the next batch and add its own delay
+          // This allows interruption during each delay period
+          await sendBufferedAudio();
         }
       };
 
@@ -1238,9 +1395,15 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
         audioBuffer.push(chunk);
         const totalBuffered = Buffer.concat(audioBuffer).length;
 
-        // Send batch if it reaches minimum size
-        if (totalBuffered >= MIN_BATCH_SIZE) {
-          sendBufferedAudio();
+        // Send batch if it reaches minimum size OR maximum size (async - will handle delays)
+        // MAX_BATCH_SIZE prevents huge batches (e.g., 141KB) that break delay logic
+        if (totalBuffered >= MIN_BATCH_SIZE || totalBuffered >= MAX_BATCH_SIZE) {
+          sendBufferedAudio().catch((error) => {
+            logger.error('[VOICE_BRIDGE_OPTIMIZED] Error in sendBufferedAudio', {
+              callSid,
+              error: error.message,
+            });
+          });
         } else {
           // Set timeout to send buffer even if small (for low latency)
           // Clear existing timeout first
@@ -1250,7 +1413,12 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
           
           bufferTimeout = setTimeout(() => {
             if (audioBuffer.length > 0) {
-              sendBufferedAudio();
+              sendBufferedAudio().catch((error) => {
+                logger.error('[VOICE_BRIDGE_OPTIMIZED] Error in sendBufferedAudio (timeout)', {
+                  callSid,
+                  error: error.message,
+                });
+              });
             }
           }, MAX_BUFFER_DELAY_MS);
         }
@@ -1265,16 +1433,26 @@ async function sendAgentResponseAsAudio(callSid: string, text: string): Promise<
           bufferTimeout = null;
         }
         
-        // Send any remaining buffered audio
+        // Send any remaining buffered audio (no delay for final batch)
         if (audioBuffer.length > 0) {
           const currentBridge = activeBridges.get(callSid);
           if (currentBridge && !currentBridge.shouldStopAudio) {
-            sendBufferedAudio();
+            // For final batch, send immediately without delay
+            const finalBatch = Buffer.concat(audioBuffer);
+            audioBuffer.length = 0;
+            const success = sendAudioToStream(callSid, finalBatch);
+            if (success) {
+              totalBytesSent += finalBatch.length;
+              batchCount++;
+            }
           } else {
             // Clear buffer if interrupted
             audioBuffer.length = 0;
           }
         }
+        
+        // No need to handle queued batches - audioBuffer already contains everything
+        // The recursive sendBufferedAudio calls will handle all buffered audio
         
         const actualDurationMs = Math.round((totalBytesSent / 8000) * 1000);
         const streamingDurationMs = Date.now() - firstChunkTime;
