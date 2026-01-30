@@ -2,6 +2,7 @@ import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import twilio from 'twilio';
 import { ElevenLabsClient } from '@elevenlabs/elevenlabs-js';
+import { queryOne } from '../db/connection';
 
 export interface VoiceCallOptions {
   to: string;
@@ -9,16 +10,22 @@ export interface VoiceCallOptions {
   from?: string;
   voiceId?: string;
   agentId?: string; // ElevenLabs agent ID for conversational calls
+  agentPhoneNumberId?: string; // ElevenLabs phone number ID for native Twilio calls
   contactId?: string; // Contact ID for context
   accountId?: string; // Account ID for agent config lookup
   useAgent?: boolean; // Whether to use agent (Media Streams) or simple TTS
+  useElevenLabsNative?: boolean; // Whether to use ElevenLabs native Twilio API
   customIntroduction?: string; // Custom introduction/greeting for agent calls
   instructions?: string; // Campaign instructions for AI context
+  campaignName?: string; // Campaign name for context
+  campaignDescription?: string; // Campaign description for context
+  campaignType?: string; // Campaign type: 'reactivation' | 'marketing' | 'survey'
 }
 
 export interface VoiceCallResult {
   success: boolean;
   callId?: string;
+  conversationId?: string; // ElevenLabs conversation ID (for native calls)
   error?: string;
 }
 
@@ -66,23 +73,331 @@ const generateAudioFromText = async (
 };
 
 /**
+ * Get agent configuration including phone number for a company
+ */
+async function getAgentConfigForCall(accountId: string): Promise<{
+  agentId: string;
+  agentPhoneNumberId: string | null;
+} | null> {
+  if (!accountId) return null;
+  
+  try {
+    const config = await queryOne<{
+      agent_id: string;
+      agent_phone_number_id: string | null;
+    }>(
+      `SELECT agent_id, agent_phone_number_id 
+       FROM ai_agent_configurations 
+       WHERE account_id = $1 AND is_active = true
+       LIMIT 1`,
+      [accountId]
+    );
+    
+    return config ? {
+      agentId: config.agent_id,
+      agentPhoneNumberId: config.agent_phone_number_id,
+    } : null;
+  } catch (error: any) {
+    logger.warn('[VOICE] Failed to get agent config', {
+      accountId,
+      error: error.message,
+    });
+    return null;
+  }
+}
+
+/**
+ * Make outbound call using ElevenLabs native Twilio API
+ * This is a simpler approach - ElevenLabs handles STT, LLM, TTS, and Twilio connection
+ */
+async function makeElevenLabsNativeCall(
+  options: VoiceCallOptions
+): Promise<VoiceCallResult> {
+  if (!env.ELEVENLABS_API_KEY) {
+    throw new Error('ELEVENLABS_API_KEY is required for ElevenLabs native calls');
+  }
+
+  if (!options.agentId) {
+    throw new Error('ElevenLabs agent_id is required for native calls');
+  }
+
+  if (!options.to) {
+    throw new Error('to_number is required');
+  }
+
+  // Get phone number from agent config if not provided directly
+  let agentPhoneNumberId = options.agentPhoneNumberId;
+  
+  if (!agentPhoneNumberId && options.accountId) {
+    const config = await getAgentConfigForCall(options.accountId);
+    if (config?.agentPhoneNumberId) {
+      agentPhoneNumberId = config.agentPhoneNumberId;
+      logger.info('[VOICE] Using phone number from agent config', {
+        accountId: options.accountId,
+        agentPhoneNumberId,
+      });
+    } else {
+      logger.warn('[VOICE] No phone number found in agent config', {
+        accountId: options.accountId,
+        agentId: options.agentId,
+        note: 'Configure agent_phone_number_id in agent config for this company',
+      });
+    }
+  }
+
+  if (!agentPhoneNumberId) {
+    throw new Error(
+      'agent_phone_number_id is required. ' +
+      'Either provide it directly or configure it in the agent config for this company.'
+    );
+  }
+
+  logger.info('[VOICE] Using ElevenLabs native Twilio outbound call API', {
+    agentId: options.agentId,
+    agentPhoneNumberId,
+    to: options.to,
+    hasInstructions: !!options.instructions,
+    hasCustomIntroduction: !!options.customIntroduction,
+    hasCampaignName: !!options.campaignName,
+    hasCampaignDescription: !!options.campaignDescription,
+    hasCampaignType: !!options.campaignType,
+    campaignName: options.campaignName,
+    campaignType: options.campaignType,
+  });
+
+  try {
+    const client = new ElevenLabsClient({
+      apiKey: env.ELEVENLABS_API_KEY,
+    });
+
+    // Build enhanced instructions with campaign context
+    let enhancedInstructions = options.instructions || '';
+
+    logger.debug('[VOICE] Building enhanced instructions', {
+      originalInstructions: options.instructions ? options.instructions.substring(0, 100) + '...' : 'none',
+      originalInstructionsLength: options.instructions?.length || 0,
+      campaignName: options.campaignName,
+      campaignDescription: options.campaignDescription,
+      campaignType: options.campaignType,
+    });
+
+    // Add campaign context to instructions so agent knows WHY it's calling
+    if (options.campaignName || options.campaignDescription || options.campaignType) {
+      const contextParts: string[] = [];
+      
+      if (options.campaignName) {
+        contextParts.push(`Campaign: ${options.campaignName}`);
+      }
+      if (options.campaignDescription) {
+        contextParts.push(`Campaign Description: ${options.campaignDescription}`);
+      }
+      if (options.campaignType) {
+        let callReason = '';
+        if (options.campaignType === 'reactivation') {
+          callReason = 'You are calling to reactivate this customer who has been inactive.';
+        } else if (options.campaignType === 'marketing') {
+          callReason = 'You are calling as part of a marketing campaign.';
+        } else if (options.campaignType === 'survey') {
+          callReason = 'You are calling to conduct a survey.';
+        }
+        if (callReason) {
+          contextParts.push(`Call Reason: ${callReason}`);
+        }
+      }
+      
+      if (contextParts.length > 0) {
+        const contextHeader = '\n\n--- Campaign Context ---\n';
+        const contextFooter = '\n--- End Campaign Context ---\n';
+        enhancedInstructions = enhancedInstructions 
+          ? `${enhancedInstructions}${contextHeader}${contextParts.join('\n')}${contextFooter}`
+          : `${contextHeader}${contextParts.join('\n')}${contextFooter}`;
+      }
+    }
+
+    logger.debug('[VOICE] Enhanced instructions built', {
+      enhancedInstructionsLength: enhancedInstructions.length,
+      enhancedInstructionsPreview: enhancedInstructions.substring(0, 300) + (enhancedInstructions.length > 300 ? '...' : ''),
+      hasCampaignContext: !!(options.campaignName || options.campaignDescription || options.campaignType),
+      isEmpty: enhancedInstructions.trim().length === 0,
+    });
+
+    // Build conversation initiation data with optional overrides (using camelCase for SDK)
+    const conversationInitiationClientData: any = {};
+
+    // Always set conversationConfigOverride if we have any overrides
+    if (options.customIntroduction || (enhancedInstructions && enhancedInstructions.trim().length > 0)) {
+      conversationInitiationClientData.conversationConfigOverride = {};
+      conversationInitiationClientData.conversationConfigOverride.agent = {};
+      
+      // Set first message - ask for permission before proceeding
+      // Use custom introduction if provided, otherwise use default permission request
+      if (options.customIntroduction) {
+        conversationInitiationClientData.conversationConfigOverride.agent.firstMessage = options.customIntroduction;
+      } else {
+        // Default first message: Ask if they have time before proceeding
+        conversationInitiationClientData.conversationConfigOverride.agent.firstMessage = 
+          "Hi! This is Remy from MultipleAI. Do you have a few minutes to talk? I'd like to check in with you about your experience with us.";
+      }
+      
+      // Use prompt override to include campaign context in agent's instructions
+      // IMPORTANT: This replaces the agent's base prompt, so include all necessary context
+      if (enhancedInstructions && enhancedInstructions.trim().length > 0) {
+        // Add instructions about waiting for permission before proceeding
+        const permissionInstructions = `\n\nIMPORTANT CALL FLOW:
+1. First, greet the customer and ask if they have a few minutes to talk.
+2. WAIT for their response. Only proceed if they confirm they have time.
+3. If they say they're busy or don't have time, politely thank them and offer to call back at a better time. End the call gracefully.
+4. If they confirm they have time, then proceed with the campaign objectives below.
+5. Be respectful of their time and keep the conversation focused and concise.\n\n`;
+        
+        conversationInitiationClientData.conversationConfigOverride.agent.prompt = {
+          prompt: `${permissionInstructions}${enhancedInstructions.trim()}`,
+          //llm: 'gpt-4o', // Default LLM - verify this matches your agent's LLM in ElevenLabs dashboard
+        };
+        
+        logger.info('[VOICE] Setting prompt override with campaign context and permission flow', {
+          promptLength: enhancedInstructions.length,
+          hasInstructions: !!options.instructions,
+          hasCampaignContext: !!(options.campaignName || options.campaignDescription || options.campaignType),
+          promptPreview: enhancedInstructions.substring(0, 200) + (enhancedInstructions.length > 200 ? '...' : ''),
+          hasPermissionFlow: true,
+        });
+      }
+    }
+
+    // Keep dynamicVariables for other systems that might use them (webhooks, etc.)
+    if (options.contactId || options.accountId) {
+      conversationInitiationClientData.dynamicVariables = {};
+      if (options.contactId) {
+        conversationInitiationClientData.dynamicVariables.contactId = options.contactId;
+      }
+      if (options.accountId) {
+        conversationInitiationClientData.dynamicVariables.accountId = options.accountId;
+      }
+    }
+
+    // Log the final structure being sent (for debugging)
+    if (Object.keys(conversationInitiationClientData).length > 0) {
+      logger.debug('[VOICE] Conversation initiation data structure', {
+        hasConfigOverride: !!conversationInitiationClientData.conversationConfigOverride,
+        hasAgent: !!conversationInitiationClientData.conversationConfigOverride?.agent,
+        hasPrompt: !!conversationInitiationClientData.conversationConfigOverride?.agent?.prompt,
+        hasFirstMessage: !!conversationInitiationClientData.conversationConfigOverride?.agent?.firstMessage,
+        hasDynamicVars: !!conversationInitiationClientData.dynamicVariables,
+        structure: JSON.stringify(conversationInitiationClientData, null, 2),
+      });
+    }
+
+    // Build the complete request body for logging (using camelCase for SDK)
+    const requestBody = {
+      agentId: options.agentId,
+      agentPhoneNumberId: agentPhoneNumberId,
+      toNumber: options.to,
+      conversationInitiationClientData: Object.keys(conversationInitiationClientData).length > 0
+        ? conversationInitiationClientData
+        : undefined,
+    };
+
+    // Log the complete POST request body
+    logger.info('[VOICE] 📤 Sending POST request to ElevenLabs Twilio outbound call API', {
+      endpoint: 'POST /v1/convai/twilio/outbound-call',
+      requestBody: JSON.stringify(requestBody, null, 2),
+      agentId: options.agentId,
+      agentPhoneNumberId: agentPhoneNumberId,
+      toNumber: options.to,
+      hasConversationInitiationData: !!requestBody.conversationInitiationClientData,
+    });
+
+    // Call ElevenLabs native API
+    // Using camelCase for SDK - if this doesn't work, we'll switch to direct HTTP request
+    const response = await client.conversationalAi.twilio.outboundCall(requestBody);
+
+    if (response.success) {
+      logger.info('[VOICE] ✅ ElevenLabs native call initiated successfully', {
+        callSid: response.callSid,
+        conversationId: response.conversationId,
+        message: response.message,
+      });
+
+      return {
+        success: true,
+        callId: response.callSid || undefined,
+        conversationId: response.conversationId || undefined,
+      };
+    } else {
+      throw new Error(response.message || 'Failed to initiate call');
+    }
+  } catch (error: any) {
+    logger.error('[VOICE] ❌ ElevenLabs native call failed', {
+      error: error.message,
+      stack: error.stack,
+      agentId: options.agentId,
+      agentPhoneNumberId,
+    });
+    throw error;
+  }
+}
+
+/**
  * Make voice call using configured provider
  * If useAgent is true, connects call to ElevenLabs agent via Media Streams
+ * If useElevenLabsNative is true, uses ElevenLabs native Twilio API
  */
 export const makeVoiceCall = async (options: VoiceCallOptions): Promise<VoiceCallResult> => {
   const provider = env.VOICE_PROVIDER || 'twilio';
-  const fromNumber = options.from || env.TWILIO_PHONE_NUMBER;
-  const voiceId = options.voiceId || env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
   const useAgent = options.useAgent || false;
+  const useElevenLabsNative = options.useElevenLabsNative || false;
 
   logger.info('[VOICE] makeVoiceCall called', {
     provider,
     to: options.to,
     useAgent,
+    useElevenLabsNative,
     hasAgentId: !!options.agentId,
+    hasAgentPhoneNumberId: !!options.agentPhoneNumberId,
     hasScript: !!options.script,
     publicWebhookUrl: env.PUBLIC_WEBHOOK_URL ? 'SET' : 'NOT SET',
   });
+
+  // AUTO-DETECT: If useAgent is true, try to use native API by default
+  // Check if we have agentId and can get phone number from config or options
+  if (useAgent && !useElevenLabsNative && options.agentId && options.accountId) {
+    // Check if phone number is already provided in options (from campaignQueue)
+    let agentPhoneNumberId = options.agentPhoneNumberId;
+    let config: { agentId: string; agentPhoneNumberId: string | null } | null = null;
+    
+    // If not provided, try to get from agent config database
+    if (!agentPhoneNumberId) {
+      config = await getAgentConfigForCall(options.accountId);
+      agentPhoneNumberId = config?.agentPhoneNumberId || undefined;
+    }
+    
+    // If we have phone number (from options or config), use native API
+    if (agentPhoneNumberId) {
+      logger.info('[VOICE] Auto-detected native API - agent config has phone number', {
+        accountId: options.accountId,
+        agentId: options.agentId,
+        agentPhoneNumberId: agentPhoneNumberId,
+        source: options.agentPhoneNumberId ? 'options' : 'database',
+        note: 'Using ElevenLabs native API by default for better latency and interruption support',
+      });
+      // Use native API with phone number
+      return makeElevenLabsNativeCall({
+        ...options,
+        agentPhoneNumberId: agentPhoneNumberId,
+        // Ensure we use the agentId from config if it exists, otherwise use provided one
+        agentId: config?.agentId || options.agentId,
+      });
+    }
+  }
+
+  // Explicit native API call (if flag is set)
+  if (useElevenLabsNative) {
+    return makeElevenLabsNativeCall(options);
+  }
+
+  const fromNumber = options.from || env.TWILIO_PHONE_NUMBER;
+  const voiceId = options.voiceId || env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
 
   try {
     if (provider === 'twilio') {
@@ -420,7 +735,11 @@ export const makeVoiceCallFromTemplate = async (
   accountId?: string,
   useAgent?: boolean,
   customIntroduction?: string,
-  instructions?: string // Campaign instructions for AI context
+  instructions?: string, // Campaign instructions for AI context
+  agentPhoneNumberId?: string, // ElevenLabs phone number ID for native Twilio calls
+  campaignName?: string, // Campaign name for context
+  campaignDescription?: string, // Campaign description for context
+  campaignType?: string // Campaign type: 'reactivation' | 'marketing' | 'survey'
 ): Promise<VoiceCallResult> => {
   const processedScript = script ? replaceTemplateVariables(script, variables) : undefined;
 
@@ -432,9 +751,13 @@ export const makeVoiceCallFromTemplate = async (
     from,
     voiceId,
     agentId,
+    agentPhoneNumberId,
     contactId,
     accountId,
     useAgent,
+    campaignName,
+    campaignDescription,
+    campaignType,
   });
 };
 

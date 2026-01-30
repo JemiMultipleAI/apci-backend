@@ -337,7 +337,13 @@ campaignQueue.process('campaign-message', 1, async (job) => {
           agentId,
           contactId,
           effectiveAccountId || undefined, // Pass effectiveAccountId to voice call
-          useAgent
+          useAgent,
+          undefined, // customIntroduction
+          undefined, // instructions
+          undefined, // agentPhoneNumberId
+          campaign.name, // Campaign name for context
+          campaign.description || undefined, // Campaign description for context
+          campaign.type || undefined // Campaign type for context
         );
 
         if (result.success) {
@@ -419,48 +425,64 @@ campaignQueue.process('campaign-message', 1, async (job) => {
         // Check if OpenAI is configured for agent mode (always use OpenAI now)
         const useAgentForOpenAI = !!env.OPENAI_API_KEY && env.OPENAI_API_KEY.trim().length > 0;
 
-        // Try to get agent config for the account (for ElevenLabs compatibility)
+        // Try to get agent config for the account (for ElevenLabs native API)
         let agentId: string | undefined;
-        if (useAgentForOpenAI) {
-          // For OpenAI, we don't need a database agent ID - use a placeholder
-          // The actual agent logic is handled by agentService which uses OpenAI Chat API
-          agentId = `openai-${campaign.id.substring(0, 8)}`; // Placeholder agent ID
-          logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode', {
-            accountId: effectiveAccountId || 'no-account',
-            agentId: agentId.substring(0, 15) + '...',
-            openAIModel: env.OPENAI_MODEL,
-          });
-        } else if (effectiveAccountId) {
-          // Fallback: Try to get agent config from database (for ElevenLabs compatibility)
+        let agentPhoneNumberId: string | undefined;
+        
+        // Always try to get agent config from database (needed for native API phone number)
+        if (effectiveAccountId) {
           try {
             logger.debug('[CAMPAIGN_QUEUE] Looking up agent config from database', { accountId: effectiveAccountId });
-            const agentConfig = await queryOne<{ agent_id: string }>(
-              `SELECT agent_id FROM ai_agent_configurations 
+            const agentConfig = await queryOne<{ 
+              agent_id: string;
+              agent_phone_number_id: string | null;
+            }>(
+              `SELECT agent_id, agent_phone_number_id 
+               FROM ai_agent_configurations 
                WHERE account_id = $1 AND is_active = true 
                LIMIT 1`,
               [effectiveAccountId]
             );
             if (agentConfig) {
               agentId = agentConfig.agent_id;
+              agentPhoneNumberId = agentConfig.agent_phone_number_id || undefined;
               logger.info('[CAMPAIGN_QUEUE] Agent config found in database', {
                 accountId: effectiveAccountId,
                 agentId: agentId.substring(0, 8) + '...',
+                hasPhoneNumber: !!agentPhoneNumberId,
+                note: agentPhoneNumberId 
+                  ? '✅ Will use ElevenLabs native API (better latency/interruption)'
+                  : '⚠️ No phone number configured - will fall back to Media Streams',
               });
             } else {
-              logger.info('[CAMPAIGN_QUEUE] No agent config found in database, will use simple TTS', {
+              logger.info('[CAMPAIGN_QUEUE] No agent config found in database', {
                 accountId: effectiveAccountId,
               });
             }
           } catch (error: any) {
-            logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config from database, using simple TTS call', {
+            logger.warn('[CAMPAIGN_QUEUE] Failed to get agent config from database', {
               accountId: effectiveAccountId,
               error: error.message,
             });
           }
-        } else if (!useAgentForOpenAI) {
-          logger.warn('[CAMPAIGN_QUEUE] OpenAI not configured, cannot use agent', {
+        }
+        
+        // If OpenAI is configured but no agent config found, use placeholder
+        if (useAgentForOpenAI && !agentId) {
+          // For OpenAI, we don't need a database agent ID - use a placeholder
+          // The actual agent logic is handled by agentService which uses OpenAI Chat API
+          agentId = `openai-${campaign.id.substring(0, 8)}`; // Placeholder agent ID
+          logger.info('[CAMPAIGN_QUEUE] Using OpenAI agent mode (no agent config found)', {
+            accountId: effectiveAccountId || 'no-account',
+            agentId: agentId.substring(0, 15) + '...',
+            openAIModel: env.OPENAI_MODEL,
+            note: 'Will use Media Streams (no phone number for native API)',
+          });
+        } else if (!useAgentForOpenAI && !agentId) {
+          logger.warn('[CAMPAIGN_QUEUE] OpenAI not configured and no agent config found, cannot use agent', {
             campaignId: campaign.id,
             hasOpenAIKey: !!env.OPENAI_API_KEY,
+            accountId: effectiveAccountId,
           });
         }
 
@@ -536,7 +558,11 @@ campaignQueue.process('campaign-message', 1, async (job) => {
             effectiveAccountId || undefined, // Pass effectiveAccountId to voice call - ensures agent gets CRM context
             useAgent,
             customIntroduction,
-            campaign.instructions // Pass campaign instructions for AI context
+            campaign.instructions, // Pass campaign instructions for AI context
+            agentPhoneNumberId, // Pass phone number if available (enables native API)
+            campaign.name, // Campaign name for context
+            campaign.description || undefined, // Campaign description for context
+            campaign.type || undefined // Campaign type for context
           );
 
           logger.info('[CAMPAIGN_QUEUE] Voice call result', {

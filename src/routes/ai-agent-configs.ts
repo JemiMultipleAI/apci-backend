@@ -15,6 +15,7 @@ const router = Router();
 const createAgentConfigSchema = z.object({
   account_id: z.string().uuid().optional().nullable(),
   agent_id: z.string().min(1), // ElevenLabs agent ID (internal)
+  agent_phone_number_id: z.string().min(1).optional().nullable(), // ElevenLabs phone number ID for native Twilio calls
   name: z.string().min(1), // Friendly name for companies
   description: z.string().optional().nullable(),
   is_active: z.boolean().optional(),
@@ -24,6 +25,7 @@ const createAgentConfigSchema = z.object({
 
 const updateAgentConfigSchema = z.object({
   agent_id: z.string().min(1).optional(),
+  agent_phone_number_id: z.string().min(1).optional().nullable(), // ElevenLabs phone number ID for native Twilio calls
   name: z.string().min(1).optional(),
   description: z.string().optional().nullable(),
   is_active: z.boolean().optional(),
@@ -100,6 +102,7 @@ router.get('/', authenticate, enrichUser, applyCompanyFilter('aac'), async (req:
         aac.name,
         aac.description,
         aac.is_active,
+        aac.agent_phone_number_id,
         aac.kb_campaigns_document_id,
         aac.kb_deals_document_id,
         aac.created_at,
@@ -219,13 +222,14 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
 
     const result = await queryOne(
       `INSERT INTO ai_agent_configurations (
-        account_id, agent_id, name, description, is_active, created_by,
+        account_id, agent_id, agent_phone_number_id, name, description, is_active, created_by,
         kb_campaigns_document_id, kb_deals_document_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING id, account_id, name, description, is_active, kb_campaigns_document_id, kb_deals_document_id, created_at, updated_at`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING id, account_id, name, description, is_active, agent_phone_number_id, kb_campaigns_document_id, kb_deals_document_id, created_at, updated_at`,
       [
         validatedData.account_id || null,
         validatedData.agent_id,
+        validatedData.agent_phone_number_id || null,
         validatedData.name,
         validatedData.description || null,
         validatedData.is_active !== undefined ? validatedData.is_active : true,
@@ -297,7 +301,7 @@ router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       `UPDATE ai_agent_configurations 
        SET ${updates.join(', ')}
        WHERE id = $${paramIndex}
-       RETURNING id, account_id, name, description, is_active, kb_campaigns_document_id, kb_deals_document_id, created_at, updated_at`,
+       RETURNING id, account_id, name, description, is_active, agent_phone_number_id, kb_campaigns_document_id, kb_deals_document_id, created_at, updated_at`,
       [...values, id]
     );
 
