@@ -23,8 +23,15 @@ export const generateRefreshToken = (payload: TokenPayload): string => {
 export const verifyAccessToken = (token: string): TokenPayload => {
   try {
     return jwt.verify(token, env.JWT_SECRET) as TokenPayload;
-  } catch (error) {
-    throw new Error('Invalid or expired access token');
+  } catch (error: any) {
+    // Log the actual JWT error for debugging
+    const errorMessage = error.name === 'TokenExpiredError' 
+      ? `Token expired at ${new Date(error.expiredAt).toISOString()}`
+      : error.name === 'JsonWebTokenError'
+      ? `Invalid token: ${error.message}`
+      : error.message || 'Unknown error';
+    
+    throw new Error(`Invalid or expired access token: ${errorMessage}`);
   }
 };
 

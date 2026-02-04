@@ -3,6 +3,8 @@ import { Server } from 'http';
 import { logger } from '../utils/logger';
 import { verifyAccessToken, TokenPayload } from '../utils/jwt';
 import { createError } from '../middleware/errorHandler';
+import { env } from '../config/env';
+import { startWebVoiceSession, handleWebAudio, stopWebVoiceSession } from './webVoiceBridge';
 
 interface ClientConnection {
   ws: WebSocket;
@@ -59,7 +61,27 @@ class WebSocketService {
       const url = new URL(req.url || '', 'http://localhost');
       const token = url.searchParams.get('token') || req.headers.authorization?.replace('Bearer ', '');
 
+      logger.info('[WEBSOCKET] Connection attempt', {
+        url: req.url,
+        pathname: url.pathname,
+        hasToken: !!token,
+        tokenFromQuery: !!url.searchParams.get('token'),
+        tokenFromHeader: !!req.headers.authorization,
+        headers: {
+          origin: req.headers.origin,
+          'user-agent': req.headers['user-agent']?.substring(0, 50),
+        },
+      });
+
       if (!token) {
+        logger.warn('[WEBSOCKET] ❌ Connection rejected - no token', {
+          url: req.url,
+          pathname: url.pathname,
+          queryParams: Object.fromEntries(url.searchParams),
+          headers: {
+            authorization: req.headers.authorization ? 'present' : 'missing',
+          },
+        });
         ws.close(1008, 'Authentication required');
         return;
       }
@@ -68,7 +90,20 @@ class WebSocketService {
       let user: TokenPayload;
       try {
         user = verifyAccessToken(token);
+        logger.debug('[WEBSOCKET] Token verified', {
+          userId: user.userId,
+          companyId: user.companyId,
+          tokenPreview: token.substring(0, 20) + '...',
+        });
       } catch (error: any) {
+        logger.warn('[WEBSOCKET] ❌ Connection rejected - invalid token', {
+          error: error.message,
+          errorName: error.name,
+          tokenPreview: token.substring(0, 20) + '...',
+          tokenLength: token.length,
+          jwtSecretSet: !!env.JWT_SECRET,
+          jwtSecretLength: env.JWT_SECRET?.length || 0,
+        });
         ws.close(1008, 'Invalid token');
         return;
       }
@@ -167,8 +202,104 @@ class WebSocketService {
         this.sendToClient(clientId, { type: 'pong' });
         break;
 
+      case 'voice_chat_start':
+        // Start web voice session
+        logger.info('[WEBSOCKET] ✅ Received voice_chat_start', {
+          clientId,
+          sessionId: message.sessionId,
+          agentId: message.agentId || 'chatbot-test-agent',
+          hasAccountId: !!message.accountId,
+          hasContactId: !!message.contactId,
+          hasInstructions: !!message.instructions,
+          hasCustomIntroduction: !!message.customIntroduction,
+        });
+        this.handleVoiceChatStart(clientId, message, connection);
+        break;
+
+      case 'audio_data':
+        // Handle audio data from browser
+        this.handleVoiceAudioData(clientId, message);
+        break;
+
+      case 'voice_chat_end':
+        // End web voice session
+        this.handleVoiceChatEnd(clientId, message);
+        break;
+
       default:
         logger.warn('Unknown WebSocket message type:', { type: message.type, clientId });
+    }
+  }
+
+  /**
+   * Handle voice chat start
+   */
+  private async handleVoiceChatStart(clientId: string, message: any, connection: ClientConnection): Promise<void> {
+    try {
+      const { sessionId, agentId, accountId, contactId, instructions, customIntroduction } = message;
+
+      if (!sessionId) {
+        this.sendToClient(clientId, {
+          type: 'error',
+          message: 'sessionId is required for voice_chat_start',
+        });
+        return;
+      }
+
+      await startWebVoiceSession(
+        connection.ws,
+        sessionId,
+        connection.userId,
+        agentId || 'chatbot-test-agent',
+        accountId,
+        contactId,
+        instructions,
+        customIntroduction
+      );
+    } catch (error: any) {
+      logger.error('Error starting voice chat session:', { error: error.message, clientId });
+      this.sendToClient(clientId, {
+        type: 'error',
+        message: 'Failed to start voice chat session',
+      });
+    }
+  }
+
+  /**
+   * Handle audio data from browser
+   */
+  private handleVoiceAudioData(clientId: string, message: any): void {
+    try {
+      const { sessionId, audio, sampleRate } = message;
+
+      if (!sessionId || !audio) {
+        logger.warn('Missing sessionId or audio in audio_data message', { clientId });
+        return;
+      }
+
+      // Decode base64 audio data
+      const audioBuffer = Buffer.from(audio, 'base64');
+      handleWebAudio(sessionId, audioBuffer, sampleRate || 16000);
+    } catch (error: any) {
+      logger.error('Error handling audio data:', { error: error.message, clientId });
+    }
+  }
+
+  /**
+   * Handle voice chat end
+   */
+  private handleVoiceChatEnd(clientId: string, message: any): void {
+    try {
+      const { sessionId } = message;
+
+      if (!sessionId) {
+        logger.warn('Missing sessionId in voice_chat_end message', { clientId });
+        return;
+      }
+
+      stopWebVoiceSession(sessionId);
+    } catch (error: any) {
+      logger.error('Error ending voice chat session:', { error: error.message, clientId });
     }
   }
 

@@ -310,6 +310,7 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
       success: true,
       data: {
         ...campaign,
+        account_id: accountId, // Include account_id for frontend (from campaign creator)
         webhook_urls: webhookUrls,
       },
     });
