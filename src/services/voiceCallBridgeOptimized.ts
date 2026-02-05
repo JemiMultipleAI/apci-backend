@@ -49,13 +49,6 @@ interface VoiceCallBridge {
   lastInterruptionTime?: number; // Track last interruption time (for debouncing rapid interruptions)
   sttReady?: boolean; // Track if STT session is ready (WebSocket connected)
   pendingSttAudio?: Array<{ chunk: Buffer; timestamp: number }>; // Queue audio until STT is ready
-  lastAISpeechText?: string; // Store the text the AI just spoke (for echo detection)
-  recentTranscripts?: Array<{ text: string; time: number }>; // Track recent transcripts for similarity detection
-  processedPartialTranscripts?: Array<{ text: string; time: number }>; // Track partial transcripts that were processed (to avoid duplicate final processing)
-  pendingAgentRequest?: { text: string; timestamp: number }; // Track pending agent request (for race condition prevention)
-  lastInterruptionTime?: number; // Track last interruption time (for debouncing rapid interruptions)
-  sttReady?: boolean; // Track if STT session is ready (WebSocket connected)
-  pendingSttAudio?: Array<{ chunk: Buffer; timestamp: number }>; // Queue audio until STT is ready
 }
 
 // Store active bridges
@@ -389,8 +382,6 @@ export async function startVoiceCallBridge(
     lastTranscriptText: undefined,
     lastTranscriptTime: undefined,
     instructions, // Store campaign instructions for all messages
-    sttReady: false, // STT not ready until SESSION_STARTED fires
-    pendingSttAudio: [], // Queue audio until STT is ready
   };
 
   activeBridges.set(callSid, bridge);
@@ -798,7 +789,7 @@ function handleSTTResult(callSid: string, result: STTResult): void {
       (timeSinceAIStarted > 1000 && result.text.trim().length > 3) // Lowered from 2000ms and 20 chars
     );
     
-    if (!isQuickInterruption && !isSubstantialSpeech) {
+    if (!isLikelyUserSpeech) {
       logger.debug('[VOICE_BRIDGE_OPTIMIZED] Ignoring transcript - likely echo while AI speaking', {
         callSid,
         text: result.text.substring(0, 50),
