@@ -6,7 +6,7 @@ export interface User {
   password_hash: string;
   first_name: string | null;
   last_name: string | null;
-  role: 'super_admin' | 'admin' | 'manager' | 'sales_rep' | 'viewer';
+  role: 'super_admin' | 'admin' | 'manager' | 'viewer';
   is_active: boolean;
   account_id: string | null;
   created_at: Date;

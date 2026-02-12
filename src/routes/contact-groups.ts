@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, enrichUser } from '../middleware/auth';
+import { authenticate, enrichUser, requireWriteAccess, requireDeleteAccess } from '../middleware/auth';
 import { query, queryOne } from '../db/connection';
 import { createError } from '../middleware/errorHandler';
 import { z } from 'zod';
@@ -129,7 +129,7 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
 });
 
 // POST /api/contact-groups - Create new contact group
-router.post('/', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -168,7 +168,7 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
 });
 
 // PUT /api/contact-groups/:id - Update contact group
-router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -231,7 +231,7 @@ router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response,
 });
 
 // DELETE /api/contact-groups/:id - Delete contact group
-router.delete('/:id', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id', authenticate, enrichUser, requireDeleteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -300,7 +300,7 @@ router.get('/contacts/:contactId/groups', authenticate, enrichUser, async (req: 
 
 // POST /api/contact-groups/contacts/:contactId/groups - Add contact to groups (bulk)
 // NOTE: This route must come BEFORE /:id/contacts to avoid route conflicts
-router.post('/contacts/:contactId/groups', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/contacts/:contactId/groups', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -348,7 +348,7 @@ router.post('/contacts/:contactId/groups', authenticate, enrichUser, async (req:
 
 // DELETE /api/contact-groups/contacts/:contactId/groups/:groupId - Remove contact from group
 // NOTE: This route must come BEFORE /:id/contacts to avoid route conflicts
-router.delete('/contacts/:contactId/groups/:groupId', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/contacts/:contactId/groups/:groupId', authenticate, enrichUser, requireDeleteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -436,7 +436,7 @@ router.get('/:id/contacts', authenticate, enrichUser, async (req: Request, res: 
 });
 
 // POST /api/contact-groups/:id/contacts - Add contacts to group (bulk)
-router.post('/:id/contacts', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/:id/contacts', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -491,7 +491,7 @@ router.post('/:id/contacts', authenticate, enrichUser, async (req: Request, res:
 });
 
 // DELETE /api/contact-groups/:id/contacts/:contactId - Remove contact from group
-router.delete('/:id/contacts/:contactId', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id/contacts/:contactId', authenticate, enrichUser, requireDeleteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));

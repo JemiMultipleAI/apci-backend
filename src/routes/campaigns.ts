@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, enrichUser } from '../middleware/auth';
+import { authenticate, enrichUser, requireWriteAccess, requireDeleteAccess } from '../middleware/auth';
 import { query, queryOne } from '../db/connection';
 import { createError } from '../middleware/errorHandler';
 import { z, ZodError } from 'zod';
@@ -55,6 +55,12 @@ const createCampaignSchema = z.object({
       email: channelConfigSchema.optional(),
       sms: channelConfigSchema.optional(),
       call: channelConfigSchema.optional(),
+    }).optional(),
+    batch_execution: z.object({
+      enabled: z.boolean().optional(),
+      batch_size: z.number().positive().optional(), // e.g., 5 contacts per batch
+      batch_interval: z.enum(['hourly', 'daily', 'weekly']).optional(), // Default: 'daily'
+      start_time: z.string().optional().nullable(), // Time of day in HH:mm format (24-hour), e.g., "09:00"
     }).optional(),
     create_followup_task: z.boolean().optional(),
     followup_task_title: z.string().optional(),
@@ -320,7 +326,7 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
 });
 
 // POST /api/campaigns - Create new campaign
-router.post('/', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', authenticate, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = createCampaignSchema.parse(req.body);
     const userId = req.user?.userId;
@@ -372,7 +378,7 @@ router.post('/', authenticate, async (req: Request, res: Response, next: NextFun
 });
 
 // PUT /api/campaigns/:id - Update campaign
-router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -463,7 +469,7 @@ router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response,
 });
 
 // DELETE /api/campaigns/:id - Delete campaign
-router.delete('/:id', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id', authenticate, enrichUser, requireDeleteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -512,7 +518,7 @@ router.delete('/:id', authenticate, enrichUser, async (req: Request, res: Respon
 });
 
 // POST /api/campaigns/:id/activate - Activate/reactivate campaign
-router.post('/:id/activate', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/:id/activate', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -575,7 +581,7 @@ router.post('/:id/activate', authenticate, enrichUser, async (req: Request, res:
 });
 
 // POST /api/campaigns/:id/pause - Pause campaign
-router.post('/:id/pause', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/:id/pause', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -638,7 +644,7 @@ router.post('/:id/pause', authenticate, enrichUser, async (req: Request, res: Re
 });
 
 // POST /api/campaigns/:id/execute - Execute campaign (send emails/SMS/make calls)
-router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/:id/execute', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -952,8 +958,35 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
     // Collect all job promises first (parallel queuing)
     const jobPromises: Promise<any>[] = [];
 
+    // Check if batch execution is enabled
+    const batchConfig = metadata?.batch_execution;
+    const useBatchExecution = batchConfig?.enabled === true && batchConfig?.batch_size && batchConfig.batch_size > 0;
+    const batchSize = batchConfig?.batch_size || 1;
+    const batchInterval = batchConfig?.batch_interval || 'daily';
+    const batchStartTime = batchConfig?.start_time || null; // e.g., "09:00"
+
+    // Calculate interval multiplier (milliseconds)
+    const intervalMultipliers = {
+      hourly: 60 * 60 * 1000,      // 1 hour
+      daily: 24 * 60 * 60 * 1000,  // 1 day
+      weekly: 7 * 24 * 60 * 60 * 1000, // 1 week
+    };
+    const intervalMs = intervalMultipliers[batchInterval] || intervalMultipliers.daily;
+
+    // Parse start time if provided
+    let startHour = 9; // Default 9 AM
+    let startMinute = 0;
+    if (batchStartTime) {
+      const timeMatch = batchStartTime.match(/^(\d{1,2}):(\d{2})$/);
+      if (timeMatch) {
+        startHour = parseInt(timeMatch[1], 10);
+        startMinute = parseInt(timeMatch[2], 10);
+      }
+    }
+
     // Prepare template variables for all contacts
-    for (const contact of contacts) {
+    for (let contactIndex = 0; contactIndex < contacts.length; contactIndex++) {
+      const contact = contacts[contactIndex];
       try {
         // Prepare template variables
         const variables: Record<string, string> = {
@@ -963,6 +996,41 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
           mobile: contact.mobile || '',
           full_name: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
         };
+
+        // Calculate batch number and delay
+        let batchDelayMs = 0;
+        if (useBatchExecution) {
+          const batchNumber = Math.floor(contactIndex / batchSize);
+          
+          // Calculate the target date/time for this batch
+          const batchStartDate = new Date(now);
+          
+          if (batchInterval === 'hourly') {
+            // For hourly intervals, add hours from now
+            batchStartDate.setTime(now.getTime() + (batchNumber * intervalMs));
+            batchStartDate.setMinutes(startMinute, 0, 0);
+          } else if (batchInterval === 'daily') {
+            // For daily intervals, add days and set time
+            batchStartDate.setDate(batchStartDate.getDate() + batchNumber);
+            batchStartDate.setHours(startHour, startMinute, 0, 0);
+          } else if (batchInterval === 'weekly') {
+            // For weekly intervals, add weeks and set time
+            batchStartDate.setDate(batchStartDate.getDate() + (batchNumber * 7));
+            batchStartDate.setHours(startHour, startMinute, 0, 0);
+          }
+          
+          // Calculate delay from now to batch start time
+          batchDelayMs = Math.max(0, batchStartDate.getTime() - now.getTime());
+          
+          logger.info('[CAMPAIGN] Batch execution calculated', {
+            contactIndex,
+            batchNumber,
+            batchSize,
+            batchInterval,
+            batchStartTime: batchStartDate.toISOString(),
+            delayMs: batchDelayMs,
+          });
+        }
 
         // Queue jobs for each enabled channel
         for (const [channelName, channelConfig] of enabledChannels) {
@@ -986,10 +1054,14 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
           let scheduledTime: Date | null = null;
 
           if (sendNow) {
-            // Immediate execution
-            delayMs = 0;
+            // If batch execution is enabled, use batch delay instead of immediate
+            if (useBatchExecution) {
+              delayMs = batchDelayMs;
+            } else {
+              delayMs = 0;
+            }
           } else {
-            // Scheduled execution
+            // Scheduled execution - combine with batch delay if enabled
             const scheduledTimeStr = channelConfig.scheduled_time;
             if (!scheduledTimeStr) {
               results.failed++;
@@ -1005,7 +1077,17 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
             }
 
             // Calculate delay in milliseconds (difference between now and scheduled time)
-            delayMs = Math.max(0, scheduledTime.getTime() - now.getTime());
+            let baseDelayMs = Math.max(0, scheduledTime.getTime() - now.getTime());
+            
+            // If batch execution is enabled, add batch delay to the scheduled time
+            if (useBatchExecution) {
+              // Add batch delay to the scheduled time
+              const batchAdjustedTime = new Date(scheduledTime);
+              batchAdjustedTime.setTime(batchAdjustedTime.getTime() + batchDelayMs);
+              delayMs = Math.max(0, batchAdjustedTime.getTime() - now.getTime());
+            } else {
+              delayMs = baseDelayMs;
+            }
           }
 
           // Create job data
@@ -1031,7 +1113,7 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
             jobData,
             {
               delay: delayMs,
-              jobId: `campaign-${campaign.id}-${channel}-${contact.id}-${Date.now()}-${Math.random()}`,
+              jobId: `campaign-${campaign.id}-${channel}-${contact.id}-batch-${useBatchExecution ? Math.floor(contactIndex / batchSize) : 0}-${Date.now()}`,
             }
           ).then((job) => {
             results.queued++;
@@ -1041,9 +1123,10 @@ router.post('/:id/execute', authenticate, enrichUser, async (req: Request, res: 
               campaignId: campaign.id,
               contactId: contact.id,
               channel,
-              sendNow: sendNow,
+              sendNow: sendNow && !useBatchExecution,
               delayMs,
-              scheduledTime: sendNow ? 'immediate' : (scheduledTime ? scheduledTime.toISOString() : 'N/A'),
+              batchNumber: useBatchExecution ? Math.floor(contactIndex / batchSize) : null,
+              scheduledTime: sendNow && !useBatchExecution ? 'immediate' : (scheduledTime ? scheduledTime.toISOString() : 'N/A'),
             });
             return job;
           }).catch((error: any) => {

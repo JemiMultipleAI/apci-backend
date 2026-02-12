@@ -128,7 +128,10 @@ export const sendSMSWithAI = async (
 
 ${instructions}
 
+IMPORTANT: Use the customer's actual name from the context provided. Do NOT use placeholders like "[Customer Name]", "[Name]", or any bracketed placeholders. Use the real name that appears in the Customer Context section of the system prompt.
+
 Please create a friendly, professional SMS that:
+- Uses the customer's actual name (from Customer Context) - do not use placeholders
 - Personalizes the message based on the customer's context
 - Follows the campaign instructions provided above
 - Is concise (under 160 characters is ideal, but can be up to 320 characters)

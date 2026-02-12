@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, enrichUser } from '../middleware/auth';
+import { authenticate, enrichUser, requireWriteAccess, requireDeleteAccess } from '../middleware/auth';
 import { query, queryOne } from '../db/connection';
 import { createError } from '../middleware/errorHandler';
 import { z, ZodError } from 'zod';
@@ -145,7 +145,7 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
 });
 
 // POST /api/surveys - Create new survey
-router.post('/', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', authenticate, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = createSurveySchema.parse(req.body);
     const userId = req.user?.userId;
@@ -176,7 +176,7 @@ router.post('/', authenticate, async (req: Request, res: Response, next: NextFun
 });
 
 // PUT /api/surveys/:id - Update survey
-router.put('/:id', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));
@@ -297,7 +297,7 @@ router.post('/responses', async (req: Request, res: Response, next: NextFunction
 });
 
 // DELETE /api/surveys/:id - Delete survey
-router.delete('/:id', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id', authenticate, enrichUser, requireDeleteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return next(createError('Unauthorized', 401));

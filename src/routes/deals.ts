@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, enrichUser } from '../middleware/auth';
+import { authenticate, enrichUser, requireWriteAccess, requireDeleteAccess } from '../middleware/auth';
 import { query, queryOne } from '../db/connection';
 import { createError } from '../middleware/errorHandler';
 import { z, ZodError } from 'zod';
@@ -226,7 +226,7 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
 });
 
 // POST /api/deals - Create new deal
-router.post('/', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = createDealSchema.parse(req.body);
     
@@ -280,7 +280,7 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
 });
 
 // PUT /api/deals/:id - Update deal
-router.put('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', authenticate, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     const validatedData = createDealSchema.partial().parse(req.body);
@@ -328,7 +328,7 @@ router.put('/:id', authenticate, async (req: Request, res: Response, next: NextF
 });
 
 // DELETE /api/deals/:id - Delete deal
-router.delete('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id', authenticate, requireDeleteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     const result = await queryOne('DELETE FROM deals WHERE id = $1 RETURNING id', [id]);

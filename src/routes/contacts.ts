@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, enrichUser } from '../middleware/auth';
+import { authenticate, enrichUser, requireWriteAccess, requireDeleteAccess } from '../middleware/auth';
 import { query, queryOne } from '../db/connection';
 import { createError } from '../middleware/errorHandler';
 import { z, ZodError } from 'zod';
@@ -250,7 +250,7 @@ router.get('/:id', authenticate, enrichUser, async (req: Request, res: Response,
 });
 
 // POST /api/contacts - Create new contact
-router.post('/', authenticate, enrichUser, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', authenticate, enrichUser, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const validatedData = createContactSchema.parse(req.body);
     
@@ -316,7 +316,7 @@ router.post('/', authenticate, enrichUser, async (req: Request, res: Response, n
 });
 
 // PUT /api/contacts/:id - Update contact
-router.put('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', authenticate, requireWriteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     const validatedData = createContactSchema.partial().parse(req.body);
@@ -361,7 +361,7 @@ router.put('/:id', authenticate, async (req: Request, res: Response, next: NextF
 });
 
 // DELETE /api/contacts/:id - Delete contact
-router.delete('/:id', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id', authenticate, requireDeleteAccess(), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     

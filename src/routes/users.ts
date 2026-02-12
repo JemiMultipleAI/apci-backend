@@ -27,7 +27,7 @@ const createUserSchema = z.object({
   password: z.string().min(8),
   first_name: z.string().optional(),
   last_name: z.string().optional(),
-  role: z.enum(['super_admin', 'admin', 'manager', 'sales_rep', 'viewer']).optional(),
+  role: z.enum(['super_admin', 'admin', 'manager', 'viewer']).optional(),
   is_active: z.boolean().optional(),
   account_id: z.string().uuid().optional().nullable(),
 });
@@ -35,7 +35,7 @@ const createUserSchema = z.object({
 const updateUserSchema = z.object({
   first_name: z.string().optional(),
   last_name: z.string().optional(),
-  role: z.enum(['super_admin', 'admin', 'manager', 'sales_rep', 'viewer']).optional(),
+  role: z.enum(['super_admin', 'admin', 'manager', 'viewer']).optional(),
   is_active: z.boolean().optional(),
   account_id: z.string().uuid().optional().nullable(),
 });

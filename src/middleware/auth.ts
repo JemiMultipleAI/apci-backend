@@ -3,6 +3,7 @@ import { verifyAccessToken, TokenPayload } from '../utils/jwt';
 import { createError } from './errorHandler';
 import { isSuperAdmin, getUserCompanyId } from '../utils/companyAccess';
 import { logger } from '../utils/logger';
+import { canPerformWriteOperation, canPerformDeleteOperation, Role } from '../utils/rolePermissions';
 
 // Extend Express Request to include user and cached company_id
 declare global {
@@ -112,3 +113,56 @@ export const requireCompanyAccess = (accountId: string) => {
   };
 };
 
+/**
+ * Middleware to require write access (create/update operations)
+ * Blocks viewers from write operations
+ */
+export const requireWriteAccess = () => {
+  return (req: Request, _res: Response, next: NextFunction) => {
+    if (!req.user) {
+      return next(createError('Unauthorized', 401));
+    }
+
+    // Super_admin bypasses all checks
+    if (isSuperAdmin(req.user)) {
+      return next();
+    }
+
+    const role = req.user.role as Role;
+    
+    // Block viewers from write operations
+    if (!canPerformWriteOperation(role)) {
+      logger.warn('Write access denied', { userId: req.user.userId, role, method: req.method, path: req.path });
+      return next(createError('Forbidden: Viewers have read-only access', 403));
+    }
+
+    next();
+  };
+};
+
+/**
+ * Middleware to require delete access
+ * Blocks viewers from delete operations
+ */
+export const requireDeleteAccess = () => {
+  return (req: Request, _res: Response, next: NextFunction) => {
+    if (!req.user) {
+      return next(createError('Unauthorized', 401));
+    }
+
+    // Super_admin bypasses all checks
+    if (isSuperAdmin(req.user)) {
+      return next();
+    }
+
+    const role = req.user.role as Role;
+    
+    // Block viewers from delete operations
+    if (!canPerformDeleteOperation(role)) {
+      logger.warn('Delete access denied', { userId: req.user.userId, role, method: req.method, path: req.path });
+      return next(createError('Forbidden: You do not have permission to delete', 403));
+    }
+
+    next();
+  };
+};
